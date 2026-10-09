@@ -9,13 +9,13 @@ import re
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="SA:MP Messenger", version="0.2")
+app = FastAPI(title="SA:MP Messenger", version="0.3")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=100)
 next_id = 0
 SESSION_TIMEOUT = 45  # seconds without a heartbeat
-MIN_MESSAGE_INTERVAL = 1.0
+MIN_MESSAGE_INTERVAL = 0.35
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
 
 
@@ -50,7 +50,7 @@ def require_client(token, now):
 def root():
     with lock:
         cleanup(monotonic())
-        return {"status": "online", "name": "SAMP Messenger", "version": "0.2", "online": len(clients)}
+        return {"status": "online", "name": "SAMP Messenger", "version": "0.3", "online": len(clients)}
 
 
 @app.post("/join")
@@ -65,7 +65,7 @@ def join(data: JoinRequest):
             raise HTTPException(status_code=409, detail="Nickname already online")
         token = uuid4().hex
         clients[token] = {"nick": nick, "last_seen": now, "last_message": 0.0}
-        return {"ok": True, "token": token, "nick": nick, "interval": 3}
+        return {"ok": True, "token": token, "nick": nick, "interval": 0.25, "last_id": next_id}
 
 
 @app.get("/state")
