@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
-app = FastAPI(title="SA:MP Messenger", version="0.4-tg")
+app = FastAPI(title="SA:MP Messenger", version="0.5-tg")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=200)
@@ -162,7 +162,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.4-tg", "online": len(clients),
+            "version": "0.5-tg", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
@@ -274,19 +274,29 @@ def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: str = Header
         return {"ok": True}
 
     if command == "/online":
+        # Count ONLY active MoonLoader clients (last heartbeat within 45 seconds).
         with lock:
             cleanup(monotonic())
             names = sorted((entry["nick"] for entry in clients.values()), key=str.lower)
-        enqueue_tg(chat_id, "SA:MP online ({}): {}".format(len(names), ", ".join(names) if names else "nobody"))
+        if names:
+            reply = "SA:MP Messenger — онлайн: {}\n".format(len(names))
+            reply += "\n".join("{}. {}".format(i, nick) for i, nick in enumerate(names, 1))
+        else:
+            reply = "SA:MP Messenger — онлайн: 0\nНет подключённых игроков."
+        enqueue_tg(chat_id, reply)
         return {"ok": True}
+
     if command == "/help":
-        enqueue_tg(chat_id, "Send any text to SA:MP, or /g your message. /online shows active users; /id shows chat ID.")
+        enqueue_tg(chat_id, "Команды:\n/g текст — отправить в чат SA:MP\n/online — список игроков со скриптом\n/id — ID Telegram-чата\nОбычные сообщения группы не пересылаются.")
         return {"ok": True}
-    if text.startswith("/"):
-        if command != "/g":
-            return {"ok": True}  # Ignore unknown commands.
-        text = text.partition(" ")[2].strip()
+
+    # Forward to SA:MP ONLY explicit /g commands from the configured group.
+    # Also accepts Telegram's /g@YourBotName syntax.
+    if command != "/g":
+        return {"ok": True}
+    text = text[len(text.split(None, 1)[0]):].strip()
     if not text:
+        enqueue_tg(chat_id, "Чтобы написать в SA:MP, используй: /g текст")
         return {"ok": True}
 
     with lock:
