@@ -13,7 +13,7 @@ from hashlib import sha256
 from hmac import compare_digest
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
-from time import monotonic
+from time import monotonic, sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -27,7 +27,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
-app = FastAPI(title="SA:MP Messenger", version="0.7-tg-reg")
+app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=200)
@@ -36,9 +36,15 @@ messages = deque(maxlen=200)
 seen_game_messages = {}  # (nick_lower, message_id) -> previous message id
 seen_game_order = deque()
 MAX_DEDUP = 2500
+# Delivery receipt statuses are kept in process memory; unlike a generic /send HTTP
+# acknowledgement, 'delivered' means Telegram's sendMessage returned ok=true.
+tg_delivery = {}  # (nick_lower, message_id) -> {status, error, updated}
+
 
 next_id = 0
 SESSION_TIMEOUT = 45
+GPS_TIMEOUT = 22  # seconds without a position -> hide marker
+GPS_MAX_PLAYERS = 40  # keep within a conservative GTA marker budget
 MIN_MESSAGE_INTERVAL = 0.35
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
 
@@ -105,6 +111,15 @@ class TokenRequest(BaseModel):
     token: str
 
 
+class GpsUpdateRequest(BaseModel):
+    token: str
+    # Users may disable location broadcasting entirely without affecting chat.
+    share: bool = True
+    x: float | None = Field(default=None, ge=-5000, le=5000, allow_inf_nan=False)
+    y: float | None = Field(default=None, ge=-5000, le=5000, allow_inf_nan=False)
+    z: float | None = Field(default=None, ge=-2500, le=5000, allow_inf_nan=False)
+
+
 def cleanup(now):
     expired = [key for key, entry in clients.items() if now - entry["last_seen"] > SESSION_TIMEOUT]
     for key in expired:
@@ -151,31 +166,47 @@ def api_request(method: str, payload: dict):
     return data
 
 
-def enqueue_tg(chat_id, text: str, reply_to_message_id=None):
-    if not BOT_TOKEN or not chat_id:
+def update_delivery(key, status: str, error: str = ""):
+    if key is None:
         return
+    with lock:
+        tg_delivery[key] = {"status": status, "error": error[:120], "updated": monotonic()}
+
+
+def enqueue_tg(chat_id, text: str, reply_to_message_id=None, delivery_key=None):
+    if not BOT_TOKEN or not chat_id:
+        update_delivery(delivery_key, "unavailable", "Telegram bot or group is not configured")
+        return False
     try:
-        tg_outgoing.put_nowait((chat_id, text[:3900], reply_to_message_id))
+        tg_outgoing.put_nowait((chat_id, text[:3900], reply_to_message_id, delivery_key))
+        return True
     except Full:
-        log.warning("Telegram outgoing queue full; dropping one notification")
+        update_delivery(delivery_key, "failed", "Telegram queue is full")
+        log.warning("Telegram outgoing queue full")
+        return False
 
 
 def telegram_worker():
     while True:
-        chat_id, text, reply_id = tg_outgoing.get()
+        chat_id, text, reply_id, delivery_key = tg_outgoing.get()
         try:
-            payload = {
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            }
+            payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
             if isinstance(reply_id, int):
-                # Telegram ignores the reply if the target message was deleted.
                 payload["reply_parameters"] = {"message_id": reply_id, "allow_sending_without_reply": True}
-            api_request("sendMessage", payload)
-        except (HTTPError, URLError, ValueError, TimeoutError) as exc:
-            # Never print the token or Telegram request URL.
-            log.warning("Telegram send failed (%s)", type(exc).__name__)
+            # Retry transient API outages. The local Lua queue is kept until Telegram
+            # confirms acceptance; a failure here must NOT count as delivered.
+            for attempt in range(4):
+                try:
+                    api_request("sendMessage", payload)
+                    update_delivery(delivery_key, "delivered")
+                    break
+                except (HTTPError, URLError, ValueError, TimeoutError) as exc:
+                    if attempt == 3 or (isinstance(exc, HTTPError) and exc.code in (400, 401, 403, 404)):
+                        update_delivery(delivery_key, "failed", "Telegram API error: " + type(exc).__name__)
+                        log.warning("Telegram send failed (%s)", type(exc).__name__)
+                        break
+                    update_delivery(delivery_key, "retrying", "Telegram temporarily unavailable")
+                    sleep(min(12, 2 ** (attempt + 1)))
         finally:
             tg_outgoing.task_done()
 
@@ -219,7 +250,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.7-tg-reg", "online": len(clients),
+            "version": "0.8-tg-receipts-gps", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
@@ -263,7 +294,14 @@ def send(data: SendRequest):
         entry = require_client(data.token, now)
         key = (entry["nick"].lower(), data.message_id) if data.message_id else None
         if key and key in seen_game_messages:
-            return {"ok": True, "id": seen_game_messages[key], "duplicate": True}
+            previous_id = seen_game_messages[key]
+            receipt = tg_delivery.get(key)
+            # A previous Telegram failure can be retried without creating a second
+            # game message. Do not requeue while another attempt is in flight.
+            if receipt and receipt["status"] == "failed" and now - receipt["updated"] >= 10:
+                tg_delivery[key] = {"status": "queued", "error": "", "updated": now}
+                enqueue_tg(TG_CHAT_ID, f"🎮 [G] {entry['nick']}: {content}", delivery_key=key)
+            return {"ok": True, "id": previous_id, "duplicate": True}
         if now - entry["last_message"] < MIN_MESSAGE_INTERVAL:
             raise HTTPException(status_code=429, detail="Please wait before sending again")
         entry["last_message"] = now
@@ -271,13 +309,63 @@ def send(data: SendRequest):
         if key:
             seen_game_messages[key] = item["id"]
             seen_game_order.append(key)
+            tg_delivery[key] = {"status": "queued", "error": "", "updated": now}
             if len(seen_game_order) > MAX_DEDUP:
                 old = seen_game_order.popleft()
                 seen_game_messages.pop(old, None)
-    # Avoid duplicate posts to Telegram on a retry.
-    if TG_CHAT_ID:
-        enqueue_tg(TG_CHAT_ID, f"🎮 [G] {item['nick']}: {content}")
+                old_receipt = tg_delivery.get(old)
+                if old_receipt and old_receipt["status"] == "delivered":
+                    tg_delivery.pop(old, None)
+    enqueue_tg(TG_CHAT_ID, f"🎮 [G] {item['nick']}: {content}", delivery_key=key)
     return {"ok": True, "id": item["id"], "duplicate": False}
+
+
+@app.get("/delivery")
+def delivery(token: str, message_id: str = Query(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")):
+    with lock:
+        now = monotonic()
+        cleanup(now)
+        entry = require_client(token, now)
+        receipt = tg_delivery.get((entry["nick"].lower(), message_id))
+        if receipt is None:
+            return {"ok": True, "status": "unknown"}
+        return {"ok": True, "status": receipt["status"], "error": receipt["error"]}
+
+
+# Optional GPS extension. Chat and Telegram routes above remain unmodified.
+# A valid session token is needed to publish/receive positions. No public GPS list.
+@app.post("/gps/update")
+def gps_update(data: GpsUpdateRequest):
+    with lock:
+        now = monotonic()
+        cleanup(now)
+        entry = require_client(data.token, now)
+        if not data.share:
+            entry.pop("gps", None)
+            return {"ok": True, "sharing": False}
+        if data.x is None or data.y is None or data.z is None:
+            raise HTTPException(status_code=400, detail="Missing GPS coordinates")
+        entry["gps"] = {"x": data.x, "y": data.y, "z": data.z, "last_update": now}
+        return {"ok": True, "sharing": True}
+
+
+@app.get("/gps/list")
+def gps_list(token: str):
+    with lock:
+        now = monotonic()
+        cleanup(now)
+        own = require_client(token, now)
+        players = []
+        for candidate in clients.values():
+            if candidate is own:
+                continue
+            point = candidate.get("gps")
+            if point is None or now - point["last_update"] > GPS_TIMEOUT:
+                continue
+            players.append({"nick": candidate["nick"], "x": point["x"],
+                            "y": point["y"], "z": point["z"]})
+        players.sort(key=lambda item: item["nick"].lower())
+        return {"ok": True, "players": players[:GPS_MAX_PLAYERS]}
 
 
 @app.post("/leave")
