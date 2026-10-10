@@ -27,7 +27,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
-app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps")
+app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps-1s")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=200)
@@ -43,7 +43,7 @@ tg_delivery = {}  # (nick_lower, message_id) -> {status, error, updated}
 
 next_id = 0
 SESSION_TIMEOUT = 45
-GPS_TIMEOUT = 22  # seconds without a position -> hide marker
+GPS_TIMEOUT = 12  # seconds without GPS updates -> remove stale marker
 GPS_MAX_PLAYERS = 40  # keep within a conservative GTA marker budget
 MIN_MESSAGE_INTERVAL = 0.35
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
@@ -250,7 +250,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.8-tg-receipts-gps", "online": len(clients),
+            "version": "0.8-tg-receipts-gps-1s", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
