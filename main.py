@@ -21,15 +21,22 @@ import json
 import logging
 import os
 import re
+import sqlite3
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
-app = FastAPI(title="SA:MP Messenger", version="0.5-tg")
+app = FastAPI(title="SA:MP Messenger", version="0.7-tg-reg")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=200)
+# In-memory deduplication of acknowledged SA:MP sends; protects against
+# duplicated delivery when the client retries after a lost HTTP response.
+seen_game_messages = {}  # (nick_lower, message_id) -> previous message id
+seen_game_order = deque()
+MAX_DEDUP = 2500
+
 next_id = 0
 SESSION_TIMEOUT = 45
 MIN_MESSAGE_INTERVAL = 0.35
@@ -44,6 +51,44 @@ tg_outgoing = Queue(maxsize=200)
 processed_updates = deque(maxlen=300)
 processed_set = set()
 
+# Registration is stored in SQLite. Render Free uses an ephemeral filesystem:
+# set REGISTRY_DB_PATH to a persistent mounted disk to retain registrations
+# across deploys/restarts (Render's free tier does not offer persistent disks).
+REGISTRY_DB_PATH = os.getenv("REGISTRY_DB_PATH", "telegram_users.sqlite3")
+
+
+def registration_connection():
+    conn = sqlite3.connect(REGISTRY_DB_PATH, timeout=5)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("""CREATE TABLE IF NOT EXISTS telegram_users (
+        user_id INTEGER PRIMARY KEY,
+        nick TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""")
+    return conn
+
+
+def registered_nick(user_id):
+    with registration_connection() as conn:
+        row = conn.execute(
+            "SELECT nick FROM telegram_users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+
+def register_nick(user_id, nick):
+    # A nick can belong to only one Telegram account. A user can change their nick.
+    with registration_connection() as conn:
+        existing = conn.execute(
+            "SELECT user_id FROM telegram_users WHERE nick = ? COLLATE NOCASE", (nick,)
+        ).fetchone()
+        if existing and existing[0] != user_id:
+            return False
+        conn.execute("""INSERT INTO telegram_users(user_id, nick)
+            VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
+            nick = excluded.nick, updated_at = CURRENT_TIMESTAMP""", (user_id, nick))
+        return True
+
 
 class JoinRequest(BaseModel):
     nick: str
@@ -52,6 +97,8 @@ class JoinRequest(BaseModel):
 class SendRequest(BaseModel):
     token: str
     text: str = Field(min_length=1, max_length=500)
+    # Optional for compatibility with existing 1.0.4 clients.
+    message_id: str | None = Field(default=None, max_length=80, pattern=r"^[a-zA-Z0-9_-]{1,80}$")
 
 
 class TokenRequest(BaseModel):
@@ -104,24 +151,28 @@ def api_request(method: str, payload: dict):
     return data
 
 
-def enqueue_tg(chat_id, text: str):
+def enqueue_tg(chat_id, text: str, reply_to_message_id=None):
     if not BOT_TOKEN or not chat_id:
         return
     try:
-        tg_outgoing.put_nowait((chat_id, text[:3900]))
+        tg_outgoing.put_nowait((chat_id, text[:3900], reply_to_message_id))
     except Full:
         log.warning("Telegram outgoing queue full; dropping one notification")
 
 
 def telegram_worker():
     while True:
-        chat_id, text = tg_outgoing.get()
+        chat_id, text, reply_id = tg_outgoing.get()
         try:
-            api_request("sendMessage", {
+            payload = {
                 "chat_id": chat_id,
                 "text": text,
                 "disable_web_page_preview": True,
-            })
+            }
+            if isinstance(reply_id, int):
+                # Telegram ignores the reply if the target message was deleted.
+                payload["reply_parameters"] = {"message_id": reply_id, "allow_sending_without_reply": True}
+            api_request("sendMessage", payload)
         except (HTTPError, URLError, ValueError, TimeoutError) as exc:
             # Never print the token or Telegram request URL.
             log.warning("Telegram send failed (%s)", type(exc).__name__)
@@ -150,6 +201,12 @@ def configure_webhook():
 
 @app.on_event("startup")
 def setup_telegram():
+    # Create the registration DB before webhooks start arriving.
+    try:
+        with registration_connection():
+            pass
+    except sqlite3.Error as exc:
+        log.error("Telegram registration database unavailable: %s", type(exc).__name__)
     # Webhook registration runs outside the HTTP request loop.
     if BOT_TOKEN:
         Thread(target=telegram_worker, daemon=True, name="telegram-sender").start()
@@ -162,7 +219,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.5-tg", "online": len(clients),
+            "version": "0.7-tg-reg", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
@@ -204,14 +261,23 @@ def send(data: SendRequest):
         now = monotonic()
         cleanup(now)
         entry = require_client(data.token, now)
+        key = (entry["nick"].lower(), data.message_id) if data.message_id else None
+        if key and key in seen_game_messages:
+            return {"ok": True, "id": seen_game_messages[key], "duplicate": True}
         if now - entry["last_message"] < MIN_MESSAGE_INTERVAL:
             raise HTTPException(status_code=429, detail="Please wait before sending again")
         entry["last_message"] = now
         item = append_message(entry["nick"], content, "game")
-    # Do not block the SA:MP HTTP request while sending to Telegram.
+        if key:
+            seen_game_messages[key] = item["id"]
+            seen_game_order.append(key)
+            if len(seen_game_order) > MAX_DEDUP:
+                old = seen_game_order.popleft()
+                seen_game_messages.pop(old, None)
+    # Avoid duplicate posts to Telegram on a retry.
     if TG_CHAT_ID:
         enqueue_tg(TG_CHAT_ID, f"🎮 [G] {item['nick']}: {content}")
-    return {"ok": True, "id": item["id"]}
+    return {"ok": True, "id": item["id"], "duplicate": False}
 
 
 @app.post("/leave")
@@ -273,6 +339,61 @@ def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: str = Header
         enqueue_tg(chat_id, "This chat is not connected to SA:MP. Ask the server owner to configure its chat ID.")
         return {"ok": True}
 
+    # A user can register only their own Telegram account; usernames are not
+    # used as identifiers because Telegram usernames can change.
+    sender = message.get("from") or {}
+    user_id = sender.get("id")
+    msg_id = message.get("message_id")
+    reply_id = msg_id if isinstance(msg_id, int) else None
+
+    if command == "/reg":
+        nick = text[len(text.split(None, 1)[0]):].strip()
+        if not isinstance(user_id, int):
+            enqueue_tg(chat_id, "Не удалось определить Telegram ID отправителя.", reply_id)
+        elif not NICK_RE.fullmatch(nick):
+            enqueue_tg(chat_id, "Регистрация: /reg Nick_Name\nНик: 3–24 символа (латинские буквы, цифры, _).", reply_id)
+        else:
+            try:
+                success = register_nick(user_id, nick)
+                if success:
+                    enqueue_tg(chat_id, f"✅ Зарегистрирован! Твой ник в SA:MP: {nick}", reply_id)
+                else:
+                    enqueue_tg(chat_id, f"Ник {nick} уже привязан к другому участнику Telegram.", reply_id)
+            except sqlite3.Error:
+                log.exception("Registration database error")
+                enqueue_tg(chat_id, "Ошибка сохранения регистрации. Попробуй позже.", reply_id)
+        return {"ok": True}
+
+    is_whoami = command == "/whoami" or bool(re.fullmatch(r"кто\s+я[?!.\s]*", text, flags=re.I))
+    is_who = command == "/who" or bool(re.fullmatch(r"кто\s+ты[?!.\s]*", text, flags=re.I))
+    if is_whoami or is_who:
+        if is_whoami:
+            target_id = user_id
+            prefix = "Твой"
+        else:
+            replied = message.get("reply_to_message") or {}
+            target_id = (replied.get("from") or {}).get("id")
+            prefix = "Его"
+            if not isinstance(target_id, int):
+                enqueue_tg(chat_id, "Ответь командой «кто ты» (или /who) на сообщение нужного человека.", reply_id)
+                return {"ok": True}
+        if not isinstance(target_id, int):
+            enqueue_tg(chat_id, "Невозможно определить Telegram ID пользователя.", reply_id)
+            return {"ok": True}
+        try:
+            nick = registered_nick(target_id)
+        except sqlite3.Error:
+            log.exception("Registration lookup error")
+            enqueue_tg(chat_id, "Ошибка чтения регистраций. Попробуй позже.", reply_id)
+            return {"ok": True}
+        if nick:
+            answer = f"{prefix} ник в SA:MP: {nick}"
+        else:
+            answer = ("Ты ещё не зарегистрирован. Используй /reg Nick_Name." if is_whoami
+                      else "Этот пользователь ещё не зарегистрировал ник в SA:MP.")
+        enqueue_tg(chat_id, answer, reply_id)
+        return {"ok": True}
+
     if command == "/online":
         # Count ONLY active MoonLoader clients (last heartbeat within 45 seconds).
         with lock:
@@ -287,7 +408,7 @@ def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: str = Header
         return {"ok": True}
 
     if command == "/help":
-        enqueue_tg(chat_id, "Команды:\n/g текст — отправить в чат SA:MP\n/online — список игроков со скриптом\n/id — ID Telegram-чата\nОбычные сообщения группы не пересылаются.")
+        enqueue_tg(chat_id, "Команды:\n/reg Nick_Name — зарегистрировать свой ник\nкто я или /whoami — узнать свой ник\nкто ты (ответом на сообщение) или /who — узнать чужой ник\n/g текст — отправить в чат SA:MP\n/online — список игроков со скриптом\n/id — ID Telegram-чата\nОбычные сообщения группы не пересылаются.")
         return {"ok": True}
 
     # Forward to SA:MP ONLY explicit /g commands from the configured group.
@@ -299,6 +420,10 @@ def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: str = Header
         enqueue_tg(chat_id, "Чтобы написать в SA:MP, используй: /g текст")
         return {"ok": True}
 
+    try:
+        game_nick = registered_nick(user_id) if isinstance(user_id, int) else None
+    except sqlite3.Error:
+        game_nick = None
     with lock:
-        append_message(pretty_sender(message.get("from") or {}), text[:500], "telegram")
+        append_message(game_nick or pretty_sender(sender), text[:500], "telegram")
     return {"ok": True}
