@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
-app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps-1s-cuffs")
+app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps-1s-cuffs-metrics-fix")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=200)
@@ -57,6 +57,17 @@ WEBHOOK_SECRET = sha256(("samp-tg-hook:" + BOT_TOKEN).encode()).hexdigest() if B
 tg_outgoing = Queue(maxsize=200)
 processed_updates = deque(maxlen=300)
 processed_set = set()
+
+# Sender health is visible at /metrics, without exposing Telegram credentials.
+telegram_sender_thread = None
+telegram_sender_lock = RLock()
+telegram_health_lock = RLock()
+telegram_health = {
+    "sent": 0,
+    "failed": 0,
+    "last_error": None,
+    "last_sent_at": None,
+}
 
 # Registration is stored in SQLite. Render Free uses an ephemeral filesystem:
 # set REGISTRY_DB_PATH to a persistent mounted disk to retain registrations
@@ -188,29 +199,82 @@ def enqueue_tg(chat_id, text: str, reply_to_message_id=None, delivery_key=None):
         return False
 
 
+def _telegram_error_name(exc):
+    """Safe diagnostics: never log bot token, URL or Telegram message content."""
+    if isinstance(exc, HTTPError):
+        return f"Telegram HTTP {exc.code}"
+    return type(exc).__name__
+
+
 def telegram_worker():
+    """Keep processing later messages even when one Telegram request fails.
+
+    urllib/http.client can raise raw OSError subclasses (including
+    ConnectionResetError and RemoteDisconnected), not only URLError.
+    """
     while True:
-        chat_id, text, reply_id, delivery_key = tg_outgoing.get()
+        chat_id, content, reply_id, delivery_key = tg_outgoing.get()
+        success = False
+        error = None
         try:
-            payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+            payload = {"chat_id": chat_id, "text": content, "disable_web_page_preview": True}
             if isinstance(reply_id, int):
                 payload["reply_parameters"] = {"message_id": reply_id, "allow_sending_without_reply": True}
-            # Retry transient API outages. The local Lua queue is kept until Telegram
-            # confirms acceptance; a failure here must NOT count as delivered.
             for attempt in range(4):
                 try:
                     api_request("sendMessage", payload)
+                    success = True
                     update_delivery(delivery_key, "delivered")
                     break
-                except (HTTPError, URLError, ValueError, TimeoutError) as exc:
-                    if attempt == 3 or (isinstance(exc, HTTPError) and exc.code in (400, 401, 403, 404)):
-                        update_delivery(delivery_key, "failed", "Telegram API error: " + type(exc).__name__)
-                        log.warning("Telegram send failed (%s)", type(exc).__name__)
+                except Exception as exc:
+                    # Do not let a connection reset or unexpected API exception
+                    # terminate the only Telegram sender thread.
+                    error = _telegram_error_name(exc)
+                    permanent = isinstance(exc, HTTPError) and exc.code in (400, 401, 403, 404)
+                    if attempt == 3 or permanent:
+                        update_delivery(delivery_key, "failed", error)
                         break
-                    update_delivery(delivery_key, "retrying", "Telegram temporarily unavailable")
+                    update_delivery(delivery_key, "retrying", "Temporary Telegram connection error")
                     sleep(min(12, 2 ** (attempt + 1)))
+        except Exception as exc:
+            error = _telegram_error_name(exc)
+            update_delivery(delivery_key, "failed", error)
         finally:
+            with telegram_health_lock:
+                if success:
+                    telegram_health["sent"] += 1
+                    telegram_health["last_sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    telegram_health["last_error"] = None
+                else:
+                    telegram_health["failed"] += 1
+                    telegram_health["last_error"] = error or "Unknown Telegram error"
+                    log.warning("Telegram send failed: %s", telegram_health["last_error"])
             tg_outgoing.task_done()
+
+
+def ensure_telegram_worker():
+    """Restart sender if it ever exits unexpectedly. Never spawn duplicates."""
+    global telegram_sender_thread
+    if not BOT_TOKEN:
+        return
+    with telegram_sender_lock:
+        if telegram_sender_thread is None or not telegram_sender_thread.is_alive():
+            telegram_sender_thread = Thread(target=telegram_worker, daemon=True, name="telegram-sender")
+            telegram_sender_thread.start()
+            log.info("Telegram sender worker started")
+
+
+def telegram_sender_status():
+    with telegram_sender_lock:
+        alive = bool(telegram_sender_thread and telegram_sender_thread.is_alive())
+    with telegram_health_lock:
+        info = telegram_health.copy()
+    return {
+        "configured": bool(BOT_TOKEN and TG_CHAT_ID),
+        "worker_alive": alive,
+        "queue_size": tg_outgoing.qsize(),
+        **info,
+    }
 
 
 def configure_webhook():
@@ -364,6 +428,7 @@ def _metrics_sampling_loop():
     while True:
         sleep(DASHBOARD_SAMPLE_SECONDS)
         try:
+            ensure_telegram_worker()
             _sample_metrics()
         except Exception as exc:
             log.warning('Performance metrics sampling failed: %s', type(exc).__name__)
@@ -431,6 +496,7 @@ footer{font-size:13px;color:#8e9eb7;margin-top:22px;line-height:1.6}
 <div class="panel"><h2>Запросы в секунду · GPS отдельно</h2><canvas id="chart-rps" class="plot"></canvas></div>
 <div class="panel"><h2>Среднее время ответа (мс)</h2><canvas id="chart-latency" class="plot"></canvas></div>
 </section>
+<section class="panel" style="margin-top:14px"><h2>Telegram: отправка из SA-MP</h2><div id="tg-status" style="line-height:1.8">Проверка отправителя...</div></section>
 <footer><span id="meta">Собираем данные...</span><p>Графики хранят последние 60 минут работы процесса. После перезапуска или обновления Render данные обнуляются. CPU может оцениваться относительно одного ядра, если контейнер не сообщает свой лимит. Панель открыта по ссылке всем, кому известен адрес.</p></footer>
 </main>
 <script>
@@ -479,6 +545,10 @@ async function refresh(){
   $('memory').textContent=n(cur.memory_mb)+' МБ';
   $('memory-sub').textContent=cur.memory_limit_mb?'Лимит: '+n(cur.memory_limit_mb,0)+' МБ':'Лимит памяти не определён';
   $('rps').textContent=n(cur.requests_per_sec,1);$('gps-rps').textContent='GPS: '+n(cur.gps_per_sec,1)+' /сек';
+  const tg=data.telegram_sender||{};
+  const tgReady=tg.configured&&tg.worker_alive;
+  $('tg-status').textContent=(tgReady?'Работает':'Требует проверки')+' · Отправлено: '+(tg.sent??0)+' · Ошибок: '+(tg.failed??0)+' · В очереди: '+(tg.queue_size??0)+(tg.last_error?' · Последняя ошибка: '+tg.last_error:'')+(tg.last_sent_at?' · Успешно: '+tg.last_sent_at:'');
+  $('tg-status').className=tgReady?'':'error';
   $('meta').textContent='Работает: '+fmt(data.uptime_seconds||0)+' · Всего запросов: '+(data.total_requests||0)+' · Время ответа: '+n(cur.avg_response_ms,1)+' мс · Последнее обновление: '+(cur.at||'—');
   linePlot('chart-cpu',hist,['cpu_percent'],'%', ['#55b9ff'],100);
   linePlot('chart-memory',hist,['memory_mb'],'МБ',['#c38bff'],cur.memory_limit_mb||0);
@@ -505,6 +575,7 @@ def metrics_data():
     return JSONResponse({
         'ok': True, 'uptime_seconds': round(monotonic() - DASHBOARD_STARTED),
         'total_requests': total, 'current': snapshot, 'history': samples,
+        'telegram_sender': telegram_sender_status(),
     }, headers={'Cache-Control': 'no-store'})
 
 
@@ -520,7 +591,7 @@ def setup_telegram():
         log.error("Telegram registration database unavailable: %s", type(exc).__name__)
     # Webhook registration runs outside the HTTP request loop.
     if BOT_TOKEN:
-        Thread(target=telegram_worker, daemon=True, name="telegram-sender").start()
+        ensure_telegram_worker()
         Thread(target=configure_webhook, daemon=True, name="telegram-webhook-setup").start()
 
 
@@ -530,7 +601,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.8-tg-receipts-gps-1s-cuffs", "online": len(clients),
+            "version": "0.8-tg-receipts-gps-1s-cuffs-metrics-fix", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
