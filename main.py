@@ -27,7 +27,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
-app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps-1s")
+app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps-1s-cuffs")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=200)
@@ -115,6 +115,7 @@ class GpsUpdateRequest(BaseModel):
     token: str
     # Users may disable location broadcasting entirely without affecting chat.
     share: bool = True
+    cuffed: bool = False  # received from server-side SA-MP action/handcuff attachment
     x: float | None = Field(default=None, ge=-5000, le=5000, allow_inf_nan=False)
     y: float | None = Field(default=None, ge=-5000, le=5000, allow_inf_nan=False)
     z: float | None = Field(default=None, ge=-2500, le=5000, allow_inf_nan=False)
@@ -250,7 +251,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.8-tg-receipts-gps-1s", "online": len(clients),
+            "version": "0.8-tg-receipts-gps-1s-cuffs", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
@@ -345,7 +346,7 @@ def gps_update(data: GpsUpdateRequest):
             return {"ok": True, "sharing": False}
         if data.x is None or data.y is None or data.z is None:
             raise HTTPException(status_code=400, detail="Missing GPS coordinates")
-        entry["gps"] = {"x": data.x, "y": data.y, "z": data.z, "last_update": now}
+        entry["gps"] = {"x": data.x, "y": data.y, "z": data.z, "cuffed": data.cuffed, "last_update": now}
         return {"ok": True, "sharing": True}
 
 
@@ -363,7 +364,7 @@ def gps_list(token: str):
             if point is None or now - point["last_update"] > GPS_TIMEOUT:
                 continue
             players.append({"nick": candidate["nick"], "x": point["x"],
-                            "y": point["y"], "z": point["z"]})
+                            "y": point["y"], "z": point["z"], "cuffed": point.get("cuffed", False)})
         players.sort(key=lambda item: item["nick"].lower())
         return {"ok": True, "players": players[:GPS_MAX_PLAYERS]}
 
