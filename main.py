@@ -13,7 +13,7 @@ from hashlib import sha256
 from hmac import compare_digest
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
-from time import monotonic, sleep
+from time import monotonic, sleep, process_time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -23,7 +23,8 @@ import os
 import re
 import sqlite3
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
@@ -231,8 +232,286 @@ def configure_webhook():
         log.warning("Telegram webhook registration failed (%s)", type(exc).__name__)
 
 
+
+
+# ===============================================================
+# Read-only performance dashboard. This does NOT modify chat/GPS
+# handlers or their response formats. Samples are kept in memory.
+# No extra Python packages or Render environment variables needed.
+# ===============================================================
+DASHBOARD_SAMPLE_SECONDS = 5
+DASHBOARD_HISTORY_LIMIT = 720  # 60 minutes at 5-second intervals
+DASHBOARD_STARTED = monotonic()
+metrics_lock = RLock()
+metrics_history = deque(maxlen=DASHBOARD_HISTORY_LIMIT)
+metrics_window = {"total": 0, "gps": 0, "errors": 0, "latency_ms": 0.0}
+metrics_total_requests = 0
+metrics_sample_time = monotonic()
+metrics_last_cpu_at = monotonic()
+metrics_last_cpu_value = None
+metrics_last_cpu_source = None
+metrics_latest = {
+    "at": datetime.now(timezone.utc).isoformat(),
+    "cpu_percent": None, "cpu_reference": None,
+    "memory_mb": None, "memory_limit_mb": None,
+    "players_online": 0, "requests_per_sec": 0.0,
+    "gps_per_sec": 0.0, "avg_response_ms": 0.0,
+    "errors_per_sec": 0.0,
+}
+
+
+def _read_one_line(path):
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            return fh.readline().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def _cgroup_cpu():
+    """Return (CPU seconds used, allowed CPU cores, description)."""
+    # cgroup v2: cpu.stat / cpu.max
+    try:
+        with open('/sys/fs/cgroup/cpu.stat', encoding='ascii') as fh:
+            for line in fh:
+                if line.startswith('usage_usec '):
+                    used = float(line.split()[1]) / 1_000_000
+                    limit = _read_one_line('/sys/fs/cgroup/cpu.max')
+                    cores = None
+                    if limit:
+                        quota, period = limit.split()[:2]
+                        if quota != 'max':
+                            cores = float(quota) / float(period)
+                    return used, cores, 'container'
+    except (OSError, ValueError, IndexError, ZeroDivisionError):
+        pass
+    # Fallback: process CPU time. Render may not expose CPU cgroup files.
+    return process_time(), None, 'process'
+
+
+def _memory_info():
+    """Return used and limit in MB. Prefer whole-container memory."""
+    used = _read_one_line('/sys/fs/cgroup/memory.current')
+    limit = _read_one_line('/sys/fs/cgroup/memory.max')
+    if used is None:
+        used = _read_one_line('/sys/fs/cgroup/memory/memory.usage_in_bytes')
+        limit = _read_one_line('/sys/fs/cgroup/memory/memory.limit_in_bytes')
+    if used is not None:
+        try:
+            value = int(used) / (1024 * 1024)
+            maximum = int(limit) / (1024 * 1024) if limit and limit != 'max' else None
+            # Ignore fake unlimited cgroup v1 limits.
+            if maximum and maximum > 1_000_000:
+                maximum = None
+            return round(value, 2), round(maximum, 2) if maximum else None
+        except (ValueError, OverflowError):
+            pass
+    # Last resort: RSS of this Python process.
+    try:
+        with open('/proc/self/status', encoding='ascii') as fh:
+            for line in fh:
+                if line.startswith('VmRSS:'):
+                    return round(int(line.split()[1]) / 1024, 2), None
+    except (OSError, ValueError, IndexError):
+        pass
+    return None, None
+
+
+def _sample_metrics():
+    global metrics_sample_time, metrics_last_cpu_at
+    global metrics_last_cpu_value, metrics_last_cpu_source
+    now = monotonic()
+    cpu_value, cpu_cores, cpu_source = _cgroup_cpu()
+    if (metrics_last_cpu_value is not None and
+            cpu_source == metrics_last_cpu_source and
+            now > metrics_last_cpu_at):
+        used_cores = max(0.0, cpu_value - metrics_last_cpu_value) / (now - metrics_last_cpu_at)
+        cpu_percent = round(100.0 * used_cores / (cpu_cores or 1.0), 2)
+        cpu_reference = ('CPU limit' if cpu_cores else '1 CPU core (estimated)')
+    else:
+        cpu_percent = None
+        cpu_reference = ('CPU limit' if cpu_cores else '1 CPU core (estimated)')
+    metrics_last_cpu_at = now
+    metrics_last_cpu_value = cpu_value
+    metrics_last_cpu_source = cpu_source
+    memory_mb, memory_limit_mb = _memory_info()
+    with lock:
+        cleanup(now)
+        players_online = len(clients)
+    with metrics_lock:
+        elapsed = max(0.1, now - metrics_sample_time)
+        counts = metrics_window.copy()
+        metrics_window.update(total=0, gps=0, errors=0, latency_ms=0.0)
+        metrics_sample_time = now
+        point = {
+            'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'cpu_percent': cpu_percent,
+            'memory_mb': memory_mb,
+            'requests_per_sec': round(counts['total'] / elapsed, 2),
+            'gps_per_sec': round(counts['gps'] / elapsed, 2),
+            'avg_response_ms': round(counts['latency_ms'] / counts['total'], 1) if counts['total'] else 0.0,
+            'errors_per_sec': round(counts['errors'] / elapsed, 2),
+            'players_online': players_online,
+        }
+        metrics_history.append(point)
+        metrics_latest.update(point)
+        metrics_latest['cpu_reference'] = cpu_reference
+        metrics_latest['memory_limit_mb'] = memory_limit_mb
+
+
+def _metrics_sampling_loop():
+    # Exceptions must never prevent the chat, GPS or Telegram from working.
+    while True:
+        sleep(DASHBOARD_SAMPLE_SECONDS)
+        try:
+            _sample_metrics()
+        except Exception as exc:
+            log.warning('Performance metrics sampling failed: %s', type(exc).__name__)
+
+
+@app.middleware('http')
+async def measure_requests(request: Request, call_next):
+    global metrics_total_requests
+    # Do not count the dashboard polling itself as application traffic.
+    if request.url.path.startswith('/metrics'):
+        return await call_next(request)
+    began = monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        with metrics_lock:
+            metrics_window['total'] += 1
+            metrics_total_requests += 1
+            metrics_window['errors'] += 1
+            metrics_window['latency_ms'] += (monotonic() - began) * 1000
+        raise
+    with metrics_lock:
+        metrics_window['total'] += 1
+        metrics_total_requests += 1
+        if request.url.path.startswith('/gps/'):
+            metrics_window['gps'] += 1
+        if response.status_code >= 500:
+            metrics_window['errors'] += 1
+        metrics_window['latency_ms'] += (monotonic() - began) * 1000
+    return response
+
+
+METRICS_PAGE = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SAMP Messenger — Нагрузка сервера</title>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color:#ecf3ff;background:#0d1422;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0}main{max-width:1250px;margin:auto;padding:27px 22px 54px}
+header{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}
+h1{font-size:26px;margin:0;font-weight:720}p{color:#93a7c3;line-height:1.5}
+.status{display:flex;align-items:center;gap:8px;color:#84e4b3;font-size:13px}
+.dot{width:9px;height:9px;border-radius:50%;background:#53dc9d;box-shadow:0 0 12px #53dc9d80}
+.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:23px 0}
+.card,.panel{background:#151f30;border:1px solid #2b394c;border-radius:14px;padding:17px}
+.card .label{font-size:13px;color:#a4b2c8}.card .value{font-size:28px;font-weight:760;margin-top:10px}
+.card .sub{font-size:12px;color:#8094af;margin-top:5px}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.panel h2{font-size:15px;font-weight:650;margin:0 0 15px}.plot{height:205px;width:100%;display:block}
+footer{font-size:13px;color:#8e9eb7;margin-top:22px;line-height:1.6}
+.error{color:#ffbb86}code{font-family:ui-monospace,Consolas,monospace}
+@media(max-width:840px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}}
+@media(max-width:470px){.cards{grid-template-columns:1fr 1fr;gap:8px}.card{padding:12px}.card .value{font-size:22px}main{padding:18px 12px}}
+</style></head><body><main>
+<header><div><h1>SAMP Messenger — нагрузка сервера</h1><p>Статистика сервера Render · обновляется раз в 5 секунд</p></div>
+<div class="status"><span class="dot"></span><span id="online-status">Подключение...</span></div></header>
+<section class="cards">
+<div class="card"><div class="label">Игроков онлайн</div><div id="players" class="value">—</div><div class="sub">Активных клиентов Messenger</div></div>
+<div class="card"><div class="label">CPU</div><div id="cpu" class="value">—</div><div id="cpu-sub" class="sub">Измерение CPU</div></div>
+<div class="card"><div class="label">RAM</div><div id="memory" class="value">—</div><div id="memory-sub" class="sub">Оперативная память</div></div>
+<div class="card"><div class="label">Запросы/сек</div><div id="rps" class="value">—</div><div id="gps-rps" class="sub">GPS: — /сек</div></div>
+</section>
+<section class="charts">
+<div class="panel"><h2>Загрузка CPU (%)</h2><canvas id="chart-cpu" class="plot"></canvas></div>
+<div class="panel"><h2>Память (МБ)</h2><canvas id="chart-memory" class="plot"></canvas></div>
+<div class="panel"><h2>Запросы в секунду · GPS отдельно</h2><canvas id="chart-rps" class="plot"></canvas></div>
+<div class="panel"><h2>Среднее время ответа (мс)</h2><canvas id="chart-latency" class="plot"></canvas></div>
+</section>
+<footer><span id="meta">Собираем данные...</span><p>Графики хранят последние 60 минут работы процесса. После перезапуска или обновления Render данные обнуляются. CPU может оцениваться относительно одного ядра, если контейнер не сообщает свой лимит. Панель открыта по ссылке всем, кому известен адрес.</p></footer>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const n=(v,d=1)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(d):'—';
+const fmt=(s)=>{const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h+' ч '+m+' мин'};
+function linePlot(id,history,fields,unit,colors,limit){
+ const canvas=$(id),ratio=window.devicePixelRatio||1,rect=canvas.getBoundingClientRect();
+ const w=Math.max(180,rect.width),h=Math.max(140,rect.height);
+ canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);
+ const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);
+ const margin={l:48,r:15,t:12,b:26},pw=w-margin.l-margin.r,ph=h-margin.t-margin.b;
+ ctx.clearRect(0,0,w,h);
+ const valid=history.flatMap(p=>fields.map(f=>p[f]).filter(v=>typeof v==='number'&&isFinite(v)));
+ const ymax=Math.max(limit||0,valid.length?Math.max(...valid)*1.15:1,0.01);
+ ctx.lineWidth=1;ctx.font='11px Segoe UI,Arial,sans-serif';ctx.textAlign='right';
+ for(let i=0;i<=4;i++){let value=ymax*(1-i/4),y=margin.t+i*ph;
+   ctx.strokeStyle='#2b3b53';ctx.beginPath();ctx.moveTo(margin.l,y);ctx.lineTo(w-margin.r,y);ctx.stroke();
+   ctx.fillStyle='#8497b2';ctx.fillText(value>=100?value.toFixed(0):value.toFixed(1),margin.l-9,y+4)}
+ if(history.length>0){ctx.textAlign='left';ctx.fillStyle='#8497b2';
+   const first=new Date(history[0].at),last=new Date(history[history.length-1].at);
+   const stamp=d=>d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+   ctx.fillText(stamp(first),margin.l,h-6);ctx.textAlign='right';ctx.fillText(stamp(last),w-margin.r,h-6)}
+ for(let f=0;f<fields.length;f++){
+   const key=fields[f];ctx.beginPath();let began=false;
+   const points=history.length;
+   for(let i=0;i<points;i++){
+     const val=history[i][key];if(typeof val!=='number'||!isFinite(val)){began=false;continue}
+     const x=margin.l+(points<=1?pw:(i/(points-1))*pw);
+     const y=margin.t+ph-Math.max(0,Math.min(val,ymax))/ymax*ph;
+     if(!began){ctx.moveTo(x,y);began=true}else ctx.lineTo(x,y)
+   }
+   ctx.strokeStyle=colors[f];ctx.lineWidth=2.3;ctx.stroke()
+ }
+ ctx.textAlign='right';ctx.fillStyle='#8d9eb8';ctx.font='11px Segoe UI,Arial,sans-serif';ctx.fillText(unit,w-margin.r,margin.t+11);
+}
+async function refresh(){
+ try{
+  const response=await fetch('/metrics/data',{cache:'no-store'});
+  if(!response.ok)throw new Error('HTTP '+response.status);
+  const data=await response.json(),cur=data.current||{},hist=data.history||[];
+  $('online-status').textContent='Сервер онлайн';$('online-status').className='';
+  $('players').textContent=cur.players_online??'—';
+  $('cpu').textContent=n(cur.cpu_percent)+'%';$('cpu-sub').textContent=cur.cpu_reference||'Нет данных';
+  $('memory').textContent=n(cur.memory_mb)+' МБ';
+  $('memory-sub').textContent=cur.memory_limit_mb?'Лимит: '+n(cur.memory_limit_mb,0)+' МБ':'Лимит памяти не определён';
+  $('rps').textContent=n(cur.requests_per_sec,1);$('gps-rps').textContent='GPS: '+n(cur.gps_per_sec,1)+' /сек';
+  $('meta').textContent='Работает: '+fmt(data.uptime_seconds||0)+' · Всего запросов: '+(data.total_requests||0)+' · Время ответа: '+n(cur.avg_response_ms,1)+' мс · Последнее обновление: '+(cur.at||'—');
+  linePlot('chart-cpu',hist,['cpu_percent'],'%', ['#55b9ff'],100);
+  linePlot('chart-memory',hist,['memory_mb'],'МБ',['#c38bff'],cur.memory_limit_mb||0);
+  linePlot('chart-rps',hist,['requests_per_sec','gps_per_sec'],'/сек',['#51d6af','#f5b962'],0);
+  linePlot('chart-latency',hist,['avg_response_ms'],'мс',['#ff8f91'],0);
+ }catch(err){$('online-status').textContent='Ошибка загрузки: '+err.message;$('online-status').className='error'}
+}
+refresh();setInterval(refresh,5000);window.addEventListener('resize',()=>{refresh()});
+</script></body></html>"""
+
+
+@app.get('/metrics', response_class=HTMLResponse)
+def metrics_page():
+    return HTMLResponse(METRICS_PAGE, headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/metrics/data')
+def metrics_data():
+    with metrics_lock:
+        snapshot = dict(metrics_latest)
+        samples = list(metrics_history)
+        # Accounted for even if the sampler has not yet ticked.
+        total = metrics_total_requests
+    return JSONResponse({
+        'ok': True, 'uptime_seconds': round(monotonic() - DASHBOARD_STARTED),
+        'total_requests': total, 'current': snapshot, 'history': samples,
+    }, headers={'Cache-Control': 'no-store'})
+
+
 @app.on_event("startup")
 def setup_telegram():
+    # Start read-only metrics sampler in the background.
+    Thread(target=_metrics_sampling_loop, daemon=True, name="performance-metrics").start()
     # Create the registration DB before webhooks start arriving.
     try:
         with registration_connection():
