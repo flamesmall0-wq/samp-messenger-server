@@ -15,7 +15,7 @@ from queue import Empty, Full, Queue
 from threading import RLock, Thread
 from time import monotonic, sleep, process_time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
 import json
 import logging
@@ -166,7 +166,7 @@ def api_request(method: str, payload: dict):
     if not BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    request = Request(
+    request = UrlRequest(
         url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json; charset=utf-8"},
