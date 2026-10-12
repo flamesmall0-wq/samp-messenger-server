@@ -1154,10 +1154,9 @@ def _fmt_report_caption(mode, start, now, rows, count_by_source):
 
 
 # ===============================================================
-# Telegram /map - self-contained geographic SCHEMATIC of GTA SA.
-# No Pillow, additional files or changes to MoonLoader are needed.
-# GPS coordinates are real and use SA-MP's -3000..3000 world axes;
-# background is schematic, NOT a pixel-perfect game texture.
+# Telegram /map - user-supplied GTA San Andreas map image.
+# This feature requires Pillow and sa_map.png in the directory of main.py.
+# Existing Lua /g, GPS, Telegram reports and cuffs are unchanged.
 
 
 def _map_nick_color(nick: str):
@@ -1314,8 +1313,24 @@ def handle_map_command(chat_id,user_id,reply_id):
             enqueue_tg(chat_id,'Не удалось поставить карту в очередь Telegram.',reply_id)
     except Exception as exc:
         log.exception('GPS map rendering failed')
-        record_report_error('gps_map',type(exc).__name__)
-        enqueue_tg(chat_id,'Не удалось сформировать GPS-карту. Проверь логи Render.',reply_id)
+        record_report_error('gps_map', type(exc).__name__)
+        # Give an actionable diagnosis without exposing private file paths,
+        # credentials, chat IDs or other server configuration in Telegram.
+        if isinstance(exc, FileNotFoundError):
+            detail = ('Не найден файл sa_map.png. Загрузите его в корень GitHub '
+                      'рядом с main.py и дождитесь успешного Deploy на Render.')
+        elif isinstance(exc, (ImportError, ModuleNotFoundError)) or (
+            isinstance(exc, RuntimeError) and 'Pillow' in str(exc)
+        ):
+            detail = ('Не установлена библиотека Pillow. Добавьте '
+                      'Pillow>=10,<13 в requirements.txt и сделайте Redeploy.')
+        elif isinstance(exc, OSError):
+            detail = ('Не удалось открыть или обработать sa_map.png. '
+                      'Проверьте, что это настоящий PNG-файл, а не ссылка на него.')
+        else:
+            detail = ('Ошибка построения: ' + type(exc).__name__ + '. '
+                      'Откройте Render -> Logs и найдите "GPS map rendering failed".')
+        enqueue_tg(chat_id, '❌ GPS-карта: ' + detail, reply_id)
 
 
 def _tg_command_allowed(chat_id, user_id):
