@@ -1204,148 +1204,100 @@ def _map_snapshot():
 
 
 def render_gps_map_png(players):
-    """Create map image using only Python standard library (fast and dependency-free)."""
-    w, h = 1080, 850
-    ocean = (19, 45, 64)
-    img = bytearray(bytes(ocean) * (w * h))
-    land = (61, 94, 76)
-    lightland = (91, 118, 86)
-    coast = (136, 176, 141)
-    roads = (166, 151, 113)
-    muted = (149, 169, 182)
-    white = (234, 241, 246)
-    black = (9, 17, 21)
+    """Render the user-provided real GTA SA map as a Telegram PNG.
 
-    def rect(x0, y0, x1, y1, color):
-        x0, y0 = max(0, int(x0)), max(0, int(y0))
-        x1, y1 = min(w, int(x1)), min(h, int(y1))
-        if x1 <= x0 or y1 <= y0:
-            return
-        color_bytes = bytes(color)
-        band = color_bytes * (x1-x0)
-        for y in range(y0, y1):
-            pos = (y*w + x0)*3
-            img[pos:pos+len(band)] = band
+    Positions use the standard GTA SA world rectangle (-3000..3000 X/Y).
+    The background is a user-supplied annotated GTA SA map at sa_map.png.
+    Only fresh, sharing-enabled GPS clients are included by _map_snapshot().
+    """
+    from pathlib import Path
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required: add Pillow to requirements.txt") from exc
 
-    def line(x0, y0, x1, y1, color, thick=1):
-        x0, y0, x1, y1 = map(int, (x0, y0, x1, y1))
-        dx, dy = abs(x1-x0), -abs(y1-y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx + dy
-        while True:
-            radius = (thick-1)//2
-            rect(x0-radius, y0-radius, x0+radius+1, y0+radius+1, color)
-            if x0 == x1 and y0 == y1:
-                break
-            e = 2*err
-            if e >= dy:
-                err += dy
-                x0 += sx
-            if e <= dx:
-                err += dx
-                y0 += sy
+    source = Path(__file__).resolve().parent / "sa_map.png"
+    if not source.is_file():
+        raise FileNotFoundError("sa_map.png is missing. Upload it beside main.py on GitHub")
 
-    def polygon(points, color, outline=None):
-        p = [(int(x), int(y)) for x,y in points]
-        y_min = max(0,min(y for _,y in p))
-        y_max = min(h-1,max(y for _,y in p))
-        for yy in range(y_min,y_max+1):
-            hit = []
-            for i, (x0,y0) in enumerate(p):
-                x1,y1=p[(i+1)%len(p)]
-                if (y0 <= yy < y1) or (y1 <= yy < y0):
-                    hit.append(int(x0+(yy-y0)*(x1-x0)/(y1-y0)))
-            hit.sort()
-            for i in range(0,len(hit)-1,2):
-                rect(hit[i],yy,hit[i+1]+1,yy+1,color)
-        for i, (x0,y0) in enumerate(p):
-            x1,y1=p[(i+1)%len(p)]
-            line(x0,y0,x1,y1,outline if outline is not None else coast,2)
+    with Image.open(source) as supplied_map:
+        base = supplied_map.convert('RGB')
+    width, height = base.size
+    # Preserve the entire supplied map, and add a separate legend to the right.
+    legend_width = 350
+    line_height = 32
+    content_height = max(height, 118 + len(players) * line_height + 70)
+    canvas = Image.new('RGB', (width + legend_width, content_height), (22, 29, 39))
+    canvas.paste(base, (0, 0))
+    draw = ImageDraw.Draw(canvas)
 
-    _FONT.setdefault('_',['00000','00000','00000','00000','00000','00000','11111'])
-    def text_at(x,y,value,color=white,scale=2):
-        cursor=int(x)
-        for ch in str(value).upper():
-            glyph = _FONT.get(ch,_FONT[' '])
-            for yy, bits in enumerate(glyph):
-                for xx, bit in enumerate(bits):
-                    if bit=='1':
-                        rect(cursor+xx*scale,y+yy*scale,
-                             cursor+(xx+1)*scale,y+(yy+1)*scale,color)
-            cursor+=6*scale
+    def font(size):
+        for path in ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+                     '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
+                     'C:/Windows/Fonts/arial.ttf'):
+            try:
+                return ImageFont.truetype(path, size)
+            except (OSError, ValueError):
+                pass
+        return ImageFont.load_default()
 
-    # World coordinates -3000..3000 on X/Y map to the 700px square.
-    left, top, side = 42, 105, 690
-    def point(x, y):
-        return (left+(max(-3000,min(3000,float(x)))+3000)*side/6000,
-                top+(3000-max(-3000,min(3000,float(y))))*side/6000)
+    heading_font = font(23)
+    nick_font = font(17)
+    detail_font = font(13)
+    draw.text((width + 23, 23), 'GPS PLAYERS', fill=(246, 249, 253), font=heading_font)
+    draw.text((width + 23, 58), f'ON MAP: {len(players)}', fill=(170, 186, 206), font=detail_font)
+    draw.line((width + 19, 90, width + legend_width - 20, 90), fill=(64, 79, 98), width=2)
 
-    rect(0,0,w,80,(14,27,41))
-    rect(755,80,w,h,(18,31,45))
-    text_at(35,20,'SAMP MESSENGER / GPS MAP',white,3)
-    text_at(35,55,'LIVE GPS SNAPSHOT  /  '+datetime.now(timezone.utc).strftime('%H:%M UTC'),muted,2)
-    text_at(780,103,'GPS PLAYERS ('+str(len(players))+')',white,2)
-    # Schematically represent the west, north-east, south-east San Andreas landmasses.
-    # These shapes are illustrative; GPS markers are positioned by true world coordinates.
-    islands = [
-       [(-2880,1850),(-2660,2520),(-2130,2750),(-1620,2890),(-1060,2440),(-1000,1650),(-1370,1050),(-1270,520),(-1550,-320),(-2100,-570),(-2830,240)],
-       [(-950,2280),(-470,2890),(580,2800),(1350,2900),(2730,2510),(2870,1690),(2490,1140),(2530,520),(1930,-260),(930,-380),(110,390),(-550,620),(-730,1290)],
-       [(-1220,-420),(-420,-630),(550,-410),(1750,-610),(2580,-970),(2910,-1690),(2580,-2660),(1850,-2940),(940,-2790),(250,-2440),(-630,-2850),(-1310,-2130),(-1580,-1110)]
-    ]
-    for island in islands:
-        polygon([point(x,y) for x,y in island],land)
-    # Local region hints and decorative roads (not precise road navigation).
-    for road in [
-        [(-2500,-280),(-1850,220),(-1850,1200),(-1300,1950),(-510,1970)],
-        [(-350,1950),(430,2160),(1100,1940),(1750,1590),(2170,850),(1460,100)],
-        [(550,-900),(1150,-1320),(1650,-2100),(2260,-2620)],
-        [(-350,650),(-100,-80),(420,-720),(1220,-1280)],
-        [(-1100,-1250),(-150,-1900),(1000,-2400)]
-    ]:
-        for (x0,y0),(x1,y1) in zip(road,road[1:]):
-            line(*point(x0,y0),*point(x1,y1),roads,3)
-    for name,x,y in [('SAN FIERRO',-2040,650),('LAS VENTURAS',1450,1700),('LOS SANTOS',1750,-1750)]:
-        px,py=point(x,y)
-        text_at(px-46,py+13,name,(205,221,208),2)
-        rect(px-3,py-3,px+4,py+4,(215,221,184))
-    # Coordinate grid shows consistent real GTA world coordinate references.
-    for n in (-3000,-1500,0,1500,3000):
-        xx,_=point(n,0)
-        _,yy=point(0,n)
-        for y in range(top,top+side,7):
-            rect(xx,y,xx+1,y+2,(50,82,99))
-        for x in range(left,left+side,7):
-            rect(x,yy,x+2,yy+1,(50,82,99))
-    # Plot black-outlined triangle at each player's actual X/Y.
-    for i,p in enumerate(players):
-        clr=_map_nick_color(p['nick'])
-        xx,yy=point(p['x'],p['y'])
-        xx=int(xx); yy=int(yy)
-        triangle=[(xx,yy-12),(xx-11,yy+9),(xx+11,yy+9)]
-        polygon(triangle,black,black)
-        polygon([(xx,yy-8),(xx-7,yy+7),(xx+7,yy+7)],clr,clr)
-        ly=145+i*24
-        if ly > 770:
-            break
-        rect(781,ly-2,796,ly+11,clr)
-        text_at(809,ly,p['nick'][:24],clr,2)
-        if p.get('cuffed'):
-            text_at(809,ly+13,'CUFFED',(240,100,105),1)
+    def pos(x, y):
+        # In GTA SA, positive Y is north. Image pixels grow downward.
+        # The original supplied map covers the standard +/-3000 world bounds.
+        x = float(x)
+        y = float(y)
+        return (round((x + 3000) * (width - 1) / 6000),
+                round((3000 - y) * (height - 1) / 6000))
+
+    def triangle(cx, cy, color):
+        outer = [(cx, cy - 15), (cx - 13, cy + 12), (cx + 13, cy + 12)]
+        draw.polygon(outer, fill=(0, 0, 0))
+        inner = [(cx, cy - 11), (cx - 9, cy + 9), (cx + 9, cy + 9)]
+        draw.polygon(inner, fill=color)
+
+    for idx, player in enumerate(players):
+        nick = str(player['nick'])[:24]
+        color = _map_nick_color(nick)
+        x, y = float(player['x']), float(player['y'])
+        if -3000 <= x <= 3000 and -3000 <= y <= 3000:
+            px, py = pos(x, y)
+            triangle(px, py, color)
+            # Text outline makes the nickname readable on complex map textures.
+            tx = max(3, min(width - 175, px + 15))
+            ty = max(2, min(height - 24, py - 11))
+            draw.text((tx, ty), nick, font=nick_font, fill=color,
+                      stroke_width=2, stroke_fill=(0, 0, 0))
+        ly = 108 + idx * line_height
+        draw.polygon([(width + 32, ly + 4),
+                      (width + 21, ly + 27),
+                      (width + 43, ly + 27)], fill=(0, 0, 0))
+        draw.polygon([(width + 32, ly + 9),
+                      (width + 26, ly + 24),
+                      (width + 38, ly + 24)], fill=color)
+        draw.text((width + 55, ly + 5), nick, fill=color, font=nick_font)
+        if player.get('cuffed'):
+            draw.text((width + 55, ly + 25), 'CUFFED', fill=(250, 88, 88), font=detail_font)
+
     if not players:
-        text_at(783,160,'NO SHARED GPS',muted,2)
-        text_at(783,185,'PLAYERS ONLINE',muted,2)
-    text_at(38,815,'MAP: SCHEMATIC / GPS X,Y: REAL',muted,2)
-    text_at(781,815,'/GSHARE OFF = HIDDEN',muted,1)
-    # Encode PNG, RGB, without third-party libraries.
-    raw=bytearray()
-    for y in range(h):
-        raw.append(0)
-        raw.extend(img[y*w*3:(y+1)*w*3])
-    def chunk(tag,data):
-        return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
-    return (b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))
-            +chunk(b'IDAT',zlib.compress(raw,6))+chunk(b'IEND',b''))
+        draw.text((width + 23, 122), 'No shared GPS players',
+                  fill=(180, 195, 214), font=nick_font)
+
+    draw.text((width + 23, content_height - 48), 'Only /gshare on players',
+              fill=(171, 187, 204), font=detail_font)
+    draw.text((width + 23, content_height - 29),
+              datetime.now(timezone.utc).strftime('%d.%m.%Y  %H:%M UTC'),
+              fill=(171, 187, 204), font=detail_font)
+
+    buffer = BytesIO()
+    canvas.save(buffer, format='PNG', optimize=True)
+    return buffer.getvalue()
 
 
 def handle_map_command(chat_id,user_id,reply_id):
@@ -1356,7 +1308,7 @@ def handle_map_command(chat_id,user_id,reply_id):
         players = _map_snapshot()
         png = render_gps_map_png(players)
         caption = ('🗺 SAMP Messenger — GPS PLAYERS: '+str(len(players))+'\n'
-                   'Точные позиции по GPS; фон карты схематический.\n'
+                   'Карта San Andreas; позиции по текущим GPS-координатам.\n'
                    'Видны только игроки с включённым /gshare on и свежими координатами.')
         if not enqueue_tg_photo(chat_id,caption,png):
             enqueue_tg(chat_id,'Не удалось поставить карту в очередь Telegram.',reply_id)
