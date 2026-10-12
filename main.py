@@ -8,12 +8,12 @@ Render environment:
 No additional Telegram libraries are required.
 """
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from hashlib import sha256
 from hmac import compare_digest
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
-from time import monotonic, sleep, process_time
+from time import monotonic, sleep, process_time, time as epoch_time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
@@ -22,13 +22,22 @@ import logging
 import os
 import re
 import sqlite3
+import struct
+import zlib
+import math
+from contextlib import contextmanager
+from io import BytesIO
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("samp_messenger")
-app = FastAPI(title="SA:MP Messenger", version="0.8-tg-receipts-gps-1s-cuffs-metrics-fix")
+app = FastAPI(title="SA:MP Messenger", version="0.9-tg-reports")
 lock = RLock()
 clients = {}  # token -> {nick, last_seen, last_message}
 messages = deque(maxlen=200)
@@ -179,6 +188,41 @@ def api_request(method: str, payload: dict):
     return data
 
 
+def api_request_photo(chat_id, caption: str, image: bytes):
+    """Send a PNG using Telegram multipart without external packages."""
+    if not BOT_TOKEN:
+        raise RuntimeError("Telegram is not configured")
+    boundary = "samp_" + uuid4().hex
+    parts = []
+    for name, value in (("chat_id", str(chat_id)), ("caption", caption[:1000])):
+        parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").encode("utf-8"))
+    parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"samp-report.png\"\r\nContent-Type: image/png\r\n\r\n").encode("utf-8"))
+    parts.append(image)
+    parts.append((f"\r\n--{boundary}--\r\n").encode("ascii"))
+    req = UrlRequest(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urlopen(req, timeout=30) as response:
+        data = json.load(response)
+    if not data.get("ok"):
+        raise ValueError("Telegram sendPhoto returned ok=false")
+    return data
+
+
+def enqueue_tg_photo(chat_id, caption: str, image: bytes):
+    if not BOT_TOKEN or not chat_id:
+        return False
+    try:
+        tg_outgoing.put_nowait(("photo", chat_id, caption, image))
+        return True
+    except Full:
+        log.warning("Telegram report queue full")
+        return False
+
+
 def update_delivery(key, status: str, error: str = ""):
     if key is None:
         return
@@ -213,7 +257,13 @@ def telegram_worker():
     ConnectionResetError and RemoteDisconnected), not only URLError.
     """
     while True:
-        chat_id, content, reply_id, delivery_key = tg_outgoing.get()
+        job = tg_outgoing.get()
+        is_photo = bool(job and job[0] == "photo")
+        if is_photo:
+            _, chat_id, content, image_bytes = job
+            reply_id, delivery_key = None, None
+        else:
+            chat_id, content, reply_id, delivery_key = job
         success = False
         error = None
         try:
@@ -222,7 +272,10 @@ def telegram_worker():
                 payload["reply_parameters"] = {"message_id": reply_id, "allow_sending_without_reply": True}
             for attempt in range(4):
                 try:
-                    api_request("sendMessage", payload)
+                    if is_photo:
+                        api_request_photo(chat_id, content, image_bytes)
+                    else:
+                        api_request("sendMessage", payload)
                     success = True
                     update_delivery(delivery_key, "delivered")
                     break
@@ -249,6 +302,10 @@ def telegram_worker():
                     telegram_health["failed"] += 1
                     telegram_health["last_error"] = error or "Unknown Telegram error"
                     log.warning("Telegram send failed: %s", telegram_health["last_error"])
+            if success and delivery_key is not None:
+                record_report_activity("game_to_tg")
+            if not success:
+                record_report_error("telegram", error or "Telegram send failed")
             tg_outgoing.task_done()
 
 
@@ -309,6 +366,10 @@ DASHBOARD_STARTED = monotonic()
 metrics_lock = RLock()
 metrics_history = deque(maxlen=DASHBOARD_HISTORY_LIMIT)
 metrics_window = {"total": 0, "gps": 0, "errors": 0, "latency_ms": 0.0}
+telemetry_lock = RLock()
+telemetry_bucket = None
+telemetry_acc = None
+
 metrics_total_requests = 0
 metrics_sample_time = monotonic()
 metrics_last_cpu_at = monotonic()
@@ -421,6 +482,11 @@ def _sample_metrics():
         metrics_latest.update(point)
         metrics_latest['cpu_reference'] = cpu_reference
         metrics_latest['memory_limit_mb'] = memory_limit_mb
+    # Persist 1-minute aggregates, independent of /metrics browser polling.
+    try:
+        report_ingest(point, counts)
+    except Exception as exc:
+        log.warning("Telemetry persistence failed (%s)", type(exc).__name__)
 
 
 def _metrics_sampling_loop():
@@ -449,6 +515,7 @@ async def measure_requests(request: Request, call_next):
             metrics_total_requests += 1
             metrics_window['errors'] += 1
             metrics_window['latency_ms'] += (monotonic() - began) * 1000
+        record_report_error("http", "Unhandled exception: " + request.url.path[:80])
         raise
     with metrics_lock:
         metrics_window['total'] += 1
@@ -458,6 +525,8 @@ async def measure_requests(request: Request, call_next):
         if response.status_code >= 500:
             metrics_window['errors'] += 1
         metrics_window['latency_ms'] += (monotonic() - began) * 1000
+    if response.status_code >= 500:
+        record_report_error("http", f"HTTP {response.status_code}: {request.url.path[:80]}")
     return response
 
 
@@ -583,6 +652,10 @@ def metrics_data():
 def setup_telegram():
     # Start read-only metrics sampler in the background.
     Thread(target=_metrics_sampling_loop, daemon=True, name="performance-metrics").start()
+    try:
+        initialize_report_storage()
+    except Exception as exc:
+        log.warning("Report database unavailable: %s", type(exc).__name__)
     # Create the registration DB before webhooks start arriving.
     try:
         with registration_connection():
@@ -601,7 +674,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.8-tg-receipts-gps-1s-cuffs-metrics-fix", "online": len(clients),
+            "version": "0.9-tg-reports", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
@@ -746,6 +819,391 @@ def pretty_sender(user: dict) -> str:
     return name[:40] or "Telegram"
 
 
+
+# ===============================================================
+# Telegram operational reports (day and calendar month).
+# Aggregates are stored in SQLite, not sent to any third-party chart API.
+# On Render Free these files are EPHEMERAL across deploy/restart: captions
+# explicitly show how much of the requested period is actually recorded.
+# ===============================================================
+REPORT_DB_PATH = os.getenv("REPORT_DB_PATH", "samp_metrics.sqlite3")
+REPORT_TZ_NAME = os.getenv("REPORT_TZ", "Europe/Kyiv")
+REPORT_TZ = timezone.utc
+if ZoneInfo is None:
+    REPORT_TZ_NAME = "UTC"
+if ZoneInfo is not None:
+    try:
+        REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
+    except (KeyError, ValueError):
+        REPORT_TZ_NAME = "UTC"
+REPORT_COMMAND_COOLDOWN = 12
+_report_last_command = {}
+
+
+@contextmanager
+def _db():
+    conn = sqlite3.connect(REPORT_DB_PATH, timeout=5)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def initialize_report_storage():
+    with _db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS telemetry (
+            minute INTEGER PRIMARY KEY, cpu REAL, ram REAL, players REAL,
+            requests INTEGER NOT NULL, gps INTEGER NOT NULL,
+            http_errors INTEGER NOT NULL, latency_sum REAL NOT NULL,
+            samples INTEGER NOT NULL)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS telemetry_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+            origin TEXT NOT NULL, description TEXT NOT NULL)''')
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_telemetry_errors_ts ON telemetry_errors(ts)")
+        conn.execute('''CREATE TABLE IF NOT EXISTS telemetry_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, kind TEXT NOT NULL)''')
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_telemetry_activity_ts ON telemetry_activity(ts)")
+        # Keep at most 45 days of minute aggregates and event records.
+        cutoff = int(epoch_time()) - 45 * 86400
+        conn.execute("DELETE FROM telemetry WHERE minute < ?", (cutoff - cutoff % 60,))
+        conn.execute("DELETE FROM telemetry_errors WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM telemetry_activity WHERE ts < ?", (cutoff,))
+
+
+def record_report_error(origin, description):
+    # Diagnostics must never include URLs with bot tokens or user messages.
+    try:
+        with _db() as conn:
+            conn.execute("INSERT INTO telemetry_errors(ts,origin,description) VALUES(?,?,?)",
+                         (int(epoch_time()), str(origin)[:30], str(description)[:160]))
+    except sqlite3.Error:
+        pass  # reporting must never break chat or GPS
+
+
+def record_report_activity(kind):
+    try:
+        with _db() as conn:
+            conn.execute("INSERT INTO telemetry_activity(ts,kind) VALUES (?,?)",
+                         (int(epoch_time()),str(kind)[:30]))
+    except sqlite3.Error:
+        pass
+
+
+def _save_acc(bucket, acc):
+    if bucket is None or not acc or acc['samples'] == 0:
+        return
+    try:
+        with _db() as conn:
+            conn.execute('''INSERT INTO telemetry (
+                minute,cpu,ram,players,requests,gps,http_errors,latency_sum,samples
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(minute) DO UPDATE SET
+                cpu=excluded.cpu,ram=excluded.ram,players=excluded.players,
+                requests=excluded.requests,gps=excluded.gps,http_errors=excluded.http_errors,
+                latency_sum=excluded.latency_sum,samples=excluded.samples''',
+                (bucket,
+                 acc['cpu_sum'] / acc['cpu_n'] if acc['cpu_n'] else None,
+                 acc['ram_sum'] / acc['ram_n'] if acc['ram_n'] else None,
+                 acc['players_sum'] / acc['samples'],
+                 acc['requests'], acc['gps'], acc['http_errors'],
+                 acc['latency_sum'], acc['samples']))
+    except sqlite3.Error as exc:
+        log.warning("Report SQLite write failed: %s", type(exc).__name__)
+
+
+def report_ingest(point, counts):
+    global telemetry_bucket, telemetry_acc
+    minute = int(epoch_time()) // 60 * 60
+    with telemetry_lock:
+        if telemetry_bucket != minute:
+            if telemetry_bucket is not None:
+                _save_acc(telemetry_bucket, telemetry_acc)
+            telemetry_bucket = minute
+            telemetry_acc = dict(samples=0, cpu_sum=0.0, cpu_n=0, ram_sum=0.0,
+                                 ram_n=0, players_sum=0.0, requests=0, gps=0,
+                                 http_errors=0, latency_sum=0.0)
+        a = telemetry_acc
+        a['samples'] += 1
+        a['players_sum'] += point['players_online']
+        for name, dest in (('cpu_percent', 'cpu'), ('memory_mb', 'ram')):
+            val = point.get(name)
+            if isinstance(val, (int, float)) and math.isfinite(val):
+                a[dest + '_sum'] += val
+                a[dest + '_n'] += 1
+        a['requests'] += counts['total']
+        a['gps'] += counts['gps']
+        a['http_errors'] += counts['errors']
+        a['latency_sum'] += counts['latency_ms']
+        # Keep the current minute visible and durable every ~30 seconds.
+        if int(epoch_time()) % 60 in range(25, 32) or int(epoch_time()) % 60 in range(55, 60):
+            _save_acc(telemetry_bucket, a)
+
+
+def report_flush():
+    with telemetry_lock:
+        _save_acc(telemetry_bucket, telemetry_acc)
+
+
+def _bounds(mode):
+    now = datetime.now(REPORT_TZ)
+    if mode == 'day':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start, now
+
+
+def load_report(mode):
+    report_flush()
+    start, now = _bounds(mode)
+    with _db() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM telemetry WHERE minute >= ? AND minute <= ? ORDER BY minute",
+                            (int(start.timestamp()), int(now.timestamp()))).fetchall()
+        counts = conn.execute("SELECT origin, COUNT(*) n FROM telemetry_errors WHERE ts >= ? GROUP BY origin",
+                              (int(start.timestamp()),)).fetchall()
+        activity = conn.execute("SELECT kind,COUNT(*) n FROM telemetry_activity WHERE ts >= ? GROUP BY kind",
+                                (int(start.timestamp()),)).fetchall()
+        errors = conn.execute("SELECT ts,origin,description FROM telemetry_errors WHERE ts >= ? ORDER BY ts DESC LIMIT 8",
+                              (int(start.timestamp()),)).fetchall()
+        error_per_minute = conn.execute("SELECT (ts / 60) * 60 m,COUNT(*) n FROM telemetry_errors WHERE ts >= ? GROUP BY m",
+                                        (int(start.timestamp()),)).fetchall()
+    event_counts = {row['m']: row['n'] for row in error_per_minute}
+    points = [dict(x) for x in rows]
+    for point in points:
+        point['failures'] = event_counts.get(point['minute'], 0)
+    summary = {x['origin']: x['n'] for x in counts}
+    summary.update({x['kind']: x['n'] for x in activity})
+    return start, now, points, summary, [dict(x) for x in errors]
+
+
+# Compact built-in 5x7 bitmap font to render PNG with zero pip dependencies.
+_FONT = {
+ 'A':['01110','10001','10001','11111','10001','10001','10001'],
+ 'B':['11110','10001','10001','11110','10001','10001','11110'],
+ 'C':['01111','10000','10000','10000','10000','10000','01111'],
+ 'D':['11110','10001','10001','10001','10001','10001','11110'],
+ 'E':['11111','10000','10000','11110','10000','10000','11111'],
+ 'F':['11111','10000','10000','11110','10000','10000','10000'],
+ 'G':['01111','10000','10000','10111','10001','10001','01110'],
+ 'H':['10001','10001','10001','11111','10001','10001','10001'],
+ 'I':['11111','00100','00100','00100','00100','00100','11111'],
+ 'J':['00111','00010','00010','00010','10010','10010','01100'],
+ 'K':['10001','10010','10100','11000','10100','10010','10001'],
+ 'L':['10000','10000','10000','10000','10000','10000','11111'],
+ 'M':['10001','11011','10101','10101','10001','10001','10001'],
+ 'N':['10001','11001','10101','10011','10001','10001','10001'],
+ 'O':['01110','10001','10001','10001','10001','10001','01110'],
+ 'P':['11110','10001','10001','11110','10000','10000','10000'],
+ 'Q':['01110','10001','10001','10001','10101','10010','01101'],
+ 'R':['11110','10001','10001','11110','10100','10010','10001'],
+ 'S':['01111','10000','10000','01110','00001','00001','11110'],
+ 'T':['11111','00100','00100','00100','00100','00100','00100'],
+ 'U':['10001','10001','10001','10001','10001','10001','01110'],
+ 'V':['10001','10001','10001','10001','10001','01010','00100'],
+ 'W':['10001','10001','10001','10101','10101','10101','01010'],
+ 'X':['10001','10001','01010','00100','01010','10001','10001'],
+ 'Y':['10001','10001','01010','00100','00100','00100','00100'],
+ 'Z':['11111','00001','00010','00100','01000','10000','11111'],
+ '0':['01110','10011','10101','10101','11001','10001','01110'],
+ '1':['00100','01100','00100','00100','00100','00100','01110'],
+ '2':['01110','10001','00001','00010','00100','01000','11111'],
+ '3':['11110','00001','00001','01110','00001','00001','11110'],
+ '4':['00010','00110','01010','10010','11111','00010','00010'],
+ '5':['11111','10000','10000','11110','00001','00001','11110'],
+ '6':['01111','10000','10000','11110','10001','10001','01110'],
+ '7':['11111','00001','00010','00100','01000','01000','01000'],
+ '8':['01110','10001','10001','01110','10001','10001','01110'],
+ '9':['01110','10001','10001','01111','00001','00001','11110'],
+ ' ':['00000']*7,
+ '-':['00000','00000','00000','11111','00000','00000','00000'],
+ ':':['00000','00100','00100','00000','00100','00100','00000'],
+ '.':['00000','00000','00000','00000','00000','00110','00110'],
+ '/':['00001','00001','00010','00100','01000','10000','10000'],
+ '%':['10001','10001','00010','00100','01000','10001','10001'],
+ '(':['00010','00100','01000','01000','01000','00100','00010'],
+ ')':['01000','00100','00010','00010','00010','00100','01000'],
+}
+
+
+def render_png_report(mode, rows, start, now):
+    # 4 independent charts on a single 980x1010 RGB image.
+    width, height = 980, 1180
+    bg=(14, 22, 35); fg=(228,237,250); muted=(141,157,181); grid=(44,56,75)
+    blue=(82,169,247); green=(91,222,166); gold=(246,191,83); red=(244,94,118)
+    image = bytearray(bytes(bg) * (width * height))
+    def px(x,y,c):
+        if 0 <= x < width and 0 <= y < height:
+            i=(y*width+x)*3
+            image[i:i+3] = bytes(c)
+    def rect(x0,y0,x1,y1,c):
+        x0=max(0,int(x0)); x1=min(width,int(x1)); y0=max(0,int(y0)); y1=min(height,int(y1))
+        triple=bytes(c)
+        row=triple * max(0,x1-x0)
+        for yy in range(y0,y1):
+            off=(yy*width+x0)*3
+            image[off:off+len(row)]=row
+    def line(x0,y0,x1,y1,c,thick=1):
+        x0=int(x0); y0=int(y0); x1=int(x1); y1=int(y1)
+        dx=abs(x1-x0); sx=1 if x0<x1 else -1
+        dy=-abs(y1-y0); sy=1 if y0<y1 else -1; err=dx+dy
+        while True:
+            for o in range(-(thick//2),thick//2+1):
+                px(x0+o,y0,c); px(x0,y0+o,c)
+            if x0==x1 and y0==y1:break
+            e2=2*err
+            if e2 >= dy: err+=dy; x0+=sx
+            if e2 <= dx: err+=dx; y0+=sy
+    def write(x,y,txt,c=fg,scale=2):
+        x=int(x); y=int(y)
+        for ch in str(txt).upper():
+            glyph=_FONT.get(ch,_FONT[' '])
+            for gy,row in enumerate(glyph):
+                for gx,p in enumerate(row):
+                    if p=='1':rect(x+gx*scale,y+gy*scale,x+(gx+1)*scale,y+(gy+1)*scale,c)
+            x+=6*scale
+    write(38,25,'SAMP MESSENGER',fg,4)
+    write(40,66,('DAY' if mode == 'day' else 'MONTH')+' REPORT '+now.strftime('%Y-%m-%d'),muted,2)
+    write(40,90,'TIME ZONE '+REPORT_TZ_NAME.replace('_',' '),muted,2)
+    timeline_start=int(start.timestamp()); timeline_end=max(timeline_start+1,int(now.timestamp()))
+    # Distribute bucket values across day/month on calendar timeline.
+    datasets=[
+        ('CPU %', 'cpu', blue, lambda a: a['cpu'] if a['cpu'] is not None else None),
+        ('RAM MB', 'ram', green, lambda a: a['ram'] if a['ram'] is not None else None),
+        ('PLAYERS ONLINE', 'players', gold, lambda a: a['players']),
+        ('REQUESTS / MIN', 'requests', blue, lambda a: a['requests']),
+        ('GPS REQUESTS / MIN', 'gps', green, lambda a: a['gps']),
+        ('ERRORS / MIN', 'failures', red, lambda a: a['failures']),
+    ]
+    # Six independent charts; exact per-minute observations with gaps left blank.
+    plot_left=92; plot_right=944; first_y=145
+    for k,(label,key,color,getval) in enumerate(datasets):
+        top=first_y+k*168; bottom=top+110
+        write(40,top-21,label,color,2)
+        for n in range(5):
+            yy=top+int(n*110/4)
+            line(plot_left,yy,plot_right,yy,grid)
+        values=[getval(r) for r in rows]
+        numeric=[v for v in values if isinstance(v,(float,int)) and math.isfinite(v)]
+        high=max(numeric) if numeric else 0
+        if high<=0:high=1
+        elif key in ('players','requests','gps','http_errors'): high=max(1,math.ceil(high))
+        write(14,top,str(round(high,1)),muted,1)
+        write(23,bottom-10,'0',muted,1)
+        prior=None
+        for r,v in zip(rows,values):
+            if v is None or not math.isfinite(v):
+                prior=None;continue
+            x=plot_left + int((r['minute']-timeline_start)/(timeline_end-timeline_start) * (plot_right-plot_left))
+            y=bottom-int(min(1,max(0,v/high))*110)
+            if prior is not None and r['minute']-prior[0]<=90:
+                line(prior[1],prior[2],x,y,color,2)
+            else:
+                rect(x-1,y-1,x+2,y+2,color)
+            prior=(r['minute'],x,y)
+        write(plot_left,bottom+10,start.strftime('%d %b %H:%M'),muted,1)
+        write(plot_right-132,bottom+10,now.strftime('%d %b %H:%M'),muted,1)
+    # Valid PNG RGB with one deflate-compressed IDAT chunk.
+    raw=bytearray()
+    for y in range(height):
+        raw.append(0)
+        raw.extend(image[y*width*3:(y+1)*width*3])
+    def chunk(kind, data):
+        return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,2,0,0,0))
+            +chunk(b'IDAT',zlib.compress(raw,6))+chunk(b'IEND',b''))
+
+
+def _fmt_report_caption(mode, start, now, rows, count_by_source):
+    label = 'сегодня' if mode == 'day' else 'текущий месяц'
+    if not rows:
+        return ('📊 SAMP Messenger — отчёт за '+label+'\n'
+                'Нет собранных измерений. Сбор начинается после запуска новой версии.\n'
+                f'Часовой пояс: {REPORT_TZ_NAME}.')
+    first=datetime.fromtimestamp(rows[0]['minute'],REPORT_TZ).strftime('%d.%m %H:%M')
+    last=datetime.fromtimestamp(rows[-1]['minute'],REPORT_TZ).strftime('%d.%m %H:%M')
+    req=sum(r['requests'] for r in rows)
+    gps=sum(r['gps'] for r in rows)
+    errors=sum(r['http_errors'] for r in rows)
+    peak=max((r['players'] for r in rows),default=0)
+    cpu=[r['cpu'] for r in rows if r['cpu'] is not None]
+    ram=[r['ram'] for r in rows if r['ram'] is not None]
+    tg_err=count_by_source.get('telegram',0)
+    # The report must never claim full coverage if the Render worker rebooted.
+    minute_span = max(1,int((now-start).total_seconds()/60)+1)
+    coverage = min(100, round(100*len(rows)/minute_span,1))
+    coverage_text = '<1' if rows and coverage < 1 else f'{coverage:g}'
+    gaps = sum(1 for a,b in zip(rows,rows[1:]) if b['minute']-a['minute'] > 180)
+    avg_latency = (sum(r['latency_sum'] for r in rows)/req) if req else 0
+    return (f'📊 SAMP Messenger — за {label}\n'
+            f'📅 Измерения: {first} — {last} ({REPORT_TZ_NAME})\n'
+            f'🕒 Покрытие периода: {coverage_text}% (пробелы не считаются работой)\n'
+            f'👥 Пик игроков онлайн: {peak:.0f}\n'
+            f'🖥 CPU среднее: {(sum(cpu)/len(cpu)) if cpu else 0:.1f}%'+('' if cpu else ' (нет данных)')+'\n'
+            f'💾 RAM среднее: {(sum(ram)/len(ram)) if ram else 0:.1f} MB'+('' if ram else ' (нет данных)')+'\n'
+            f'🌐 HTTP запросы: {req}, GPS: {gps}\n'
+            f'💬 SA-MP → Telegram: {count_by_source.get("game_to_tg",0)}\n'
+            f'⏱ Средний ответ HTTP: {avg_latency:.0f} мс\n'
+            f'⚠ HTTP 5xx: {errors}, ошибки Telegram: {tg_err}\n'
+            f'⏸ Пробелы мониторинга: {gaps} (не обязательно сбои)\n'
+            '⚠ Render Free: при перезапуске история может сбрасываться.')
+
+
+def _tg_command_allowed(chat_id, user_id):
+    # One report per account per 12 seconds prevents large Telegram photo spam.
+    key = (str(chat_id), user_id)
+    now=monotonic()
+    with telemetry_lock:
+        if now-_report_last_command.get(key,-1e9) < REPORT_COMMAND_COOLDOWN:
+            return False
+        _report_last_command[key]=now
+        return True
+
+
+def handle_report_command(command, chat_id, user_id, reply_id):
+    if not _tg_command_allowed(chat_id,user_id):
+        enqueue_tg(chat_id,'Подожди 12 секунд перед следующей командой отчёта.',reply_id)
+        return
+    try:
+        if command in ('/dayreport','/monthreport'):
+            mode = 'day' if command=='/dayreport' else 'month'
+            start, now, rows, counts, errors = load_report(mode)
+            caption = _fmt_report_caption(mode,start,now,rows,counts)
+            photo = render_png_report(mode,rows,start,now)
+            if not enqueue_tg_photo(chat_id,caption,photo):
+                enqueue_tg(chat_id,'Не удалось добавить график в очередь Telegram.',reply_id)
+        elif command == '/errors':
+            start,now,rows,counts,errors=load_report('day')
+            if errors:
+                result=['⚠ Ошибки сервера за сегодня:']
+                for e in errors:
+                    when=datetime.fromtimestamp(e['ts'],REPORT_TZ).strftime('%H:%M:%S')
+                    result.append(f"{when} · {e['origin']}: {e['description']}")
+                result.append('Время: '+REPORT_TZ_NAME)
+                enqueue_tg(chat_id,'\n'.join(result)[:3900],reply_id)
+            else:
+                enqueue_tg(chat_id,'За сегодня записанных ошибок нет (либо журнал был сброшен перезапуском).',reply_id)
+        elif command == '/status':
+            with lock:
+                cleanup(monotonic()); n=len(clients)
+            with metrics_lock:
+                m=dict(metrics_latest)
+            t=telegram_sender_status()
+            enqueue_tg(chat_id,(f'🟢 SAMP Messenger\n👥 Онлайн: {n}\n'
+                f'CPU: {m.get("cpu_percent") if m.get("cpu_percent") is not None else "нет данных"}%\n'
+                f'RAM: {m.get("memory_mb") if m.get("memory_mb") is not None else "нет данных"} MB\n'
+                f'HTTP: {m.get("requests_per_sec")} / сек, GPS: {m.get("gps_per_sec")} / сек\n'
+                f'Telegram: {"работает" if t["worker_alive"] else "неактивен"}\n'
+                f'Отправлено: {t["sent"]}, ошибок: {t["failed"]}, очередь: {t["queue_size"]}'),reply_id)
+    except Exception as exc:
+        record_report_error('report',type(exc).__name__)
+        log.exception('Telegram report command failed')
+        enqueue_tg(chat_id,'Не удалось сформировать отчёт. Проверь логи Render.',reply_id)
+
+
 @app.post("/telegram/webhook")
 def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: str = Header(default="")):
     if not BOT_TOKEN or not compare_digest(x_telegram_bot_api_secret_token, WEBHOOK_SECRET):
@@ -784,6 +1242,11 @@ def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: str = Header
     user_id = sender.get("id")
     msg_id = message.get("message_id")
     reply_id = msg_id if isinstance(msg_id, int) else None
+    if command in ("/dayreport", "/monthreport", "/errors", "/status"):
+        # Avoid blocking Telegram webhook during PNG rendering.
+        Thread(target=handle_report_command, args=(command, chat_id, user_id, reply_id),
+               daemon=True, name="telegram-report").start()
+        return {"ok": True}
 
     if command == "/reg":
         nick = text[len(text.split(None, 1)[0]):].strip()
@@ -847,7 +1310,7 @@ def telegram_webhook(update: dict, x_telegram_bot_api_secret_token: str = Header
         return {"ok": True}
 
     if command == "/help":
-        enqueue_tg(chat_id, "Команды:\n/reg Nick_Name — зарегистрировать свой ник\nкто я или /whoami — узнать свой ник\nкто ты (ответом на сообщение) или /who — узнать чужой ник\n/g текст — отправить в чат SA:MP\n/online — список игроков со скриптом\n/id — ID Telegram-чата\nОбычные сообщения группы не пересылаются.")
+        enqueue_tg(chat_id, "Команды:\n/reg Nick_Name — зарегистрировать свой ник\nкто я или /whoami — узнать свой ник\nкто ты (ответом на сообщение) или /who — узнать чужой ник\n/g текст — отправить в чат SA:MP\n/online — список игроков со скриптом\n/id — ID Telegram-чата\n/dayreport — график нагрузки за сегодня\n/monthreport — график нагрузки за текущий месяц\n/errors — последние ошибки за сегодня\n/status — текущая нагрузка сервера\nОбычные сообщения группы не пересылаются.")
         return {"ok": True}
 
     # Forward to SA:MP ONLY explicit /g commands from the configured group.
