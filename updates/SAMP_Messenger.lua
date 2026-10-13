@@ -1,6 +1,6 @@
 script_name('SAMP Messenger')
 script_author('Flame_Small | SAMP Messenger project')
-script_version('1.1.7')
+script_version('1.1.8')
 
 local hasImgui, imgui = pcall(require, 'mimgui')
 local ffi = require 'ffi'
@@ -286,7 +286,7 @@ end
 
 -- Silent GitHub updater (runs separately and never modifies the active in-memory Lua).
 -- Publishes a backup with .bak extension in SAMP_Messenger/backups/.
-local AUTO_UPDATE_VERSION = '1.1.7'
+local AUTO_UPDATE_VERSION = '1.1.8'
 local AUTO_UPDATE_INTERVAL_SECONDS = 1800
 local AUTO_UPDATE_HELPER = SESSION .. 'auto_updater.ps1'
 local lastAutoUpdateCheck = -999999
@@ -1080,7 +1080,7 @@ local function sendMessage(txt, target)
   if show_in_game and isSampAvailable() then
     local chatLine = isCuffHelpText(clean, shared.nick) and ('[G] ' .. clean) or ('[G] ' .. tostring(shared.nick or '?') .. ': ' .. clean)
     local converted, cp1251 = pcall(function() return u8:decode(chatLine) end)
-    sampAddChatMessage(converted and cp1251 or chatLine, isCuffHelpText(clean, shared.nick) and 0xFF3535 or 0x8DDDFF)
+    sampAddChatMessage(converted and cp1251 or chatLine, isCuffHelpText(clean, shared.nick) and 0xFF3535 or 0x69B8DB)
   end
   showToast('Отправляется в Telegram: ' .. clean)
   return true
@@ -1103,7 +1103,7 @@ local function addMessage(entry)
     -- Telegram messages are violet; the standard /g chat stays light blue.
     local cuffNotice = not isTelegram and isCuffHelpText(message, nickname)
     local display = cuffNotice and ('[G] ' .. message) or (prefix .. message)
-    sampAddChatMessage(safeChatText(display), cuffNotice and 0xFF3535 or (isTelegram and 0xD5A0FF or 0x8DDDFF))
+    sampAddChatMessage(safeChatText(display), cuffNotice and 0xFF3535 or (isTelegram and 0xD5A0FF or 0x69B8DB))
   end
 end
 
@@ -1695,7 +1695,7 @@ function main()
       for i=#messages,1,-1 do
         local m=messages[i]
         if m.me then
-          sampAddChatMessage(safeChatText('[My G] '..tostring(m.text):sub(1,120)),0x8DDDFF)
+          sampAddChatMessage(safeChatText('[My G] '..tostring(m.text):sub(1,120)),0x69B8DB)
           shown=shown+1
           if shown>=8 then break end
         end
@@ -1814,7 +1814,7 @@ function main()
     local ok, utftext = pcall(gameInputToUtf8, txt)
     sendMessage(expandCodes(ok and utftext or txt), 1)
   end)
-  sampAddChatMessage(safeChatText('[SAMP Messenger] 1.1.6 (Помощь /gpshelp, /messhelp; код /gkey)'),0x66CCFF)
+  sampAddChatMessage(safeChatText('[SAMP Messenger] 1.1.8 (Помощь /gpshelp, /messhelp; код /gkey)'),0x66CCFF)
   checkAutoUpdate()
   local ok,id = sampGetPlayerIdByCharHandle(PLAYER_PED)
   if ok then
