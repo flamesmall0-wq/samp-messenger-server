@@ -259,14 +259,17 @@ def enqueue_tg(chat_id, text: str, reply_to_message_id=None, delivery_key=None, 
 
 
 def format_game_telegram_message(nick: str, content: str):
-    """Telegram HTML with bold sender; no sender prefix for cuff-help alerts.
+    """HTML-safe Telegram layout: bold nick, plain text, no quote marks.
 
-    Match the client's exact automatic alert text rather than removing sender
-    names from other messages. HTML-escape user content before enabling HTML.
+    Recognize both historical and new exact cuff-alert formats so older
+    clients still produce the current alert while people auto-update.
     """
-    if content == f'"{nick}" кафают помогите ему':
-        return f"🎮 [G] {html_escape(content)}"
-    return f'🎮 [G] <b>{html_escape(nick)}</b>: "{html_escape(content)}"'
+    old_cuff = f'"{nick}" кафают помогите ему'
+    new_cuff = f'{nick} в наручниках! Помогите ему — его метка находится на карте.'
+    if content in (old_cuff, new_cuff):
+        return (f'🎮 [G] <b>{html_escape(nick)}</b> в наручниках! '
+                'Помогите ему — его метка находится на карте.')
+    return f'🎮 [G] <b>{html_escape(nick)}</b>: {html_escape(content)}'
 
 
 def _telegram_error_name(exc):
