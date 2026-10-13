@@ -1,6 +1,6 @@
 script_name('SAMP Messenger')
 script_author('Flame_Small | SAMP Messenger project')
-script_version('1.1.6')
+script_version('1.1.7')
 
 local hasImgui, imgui = pcall(require, 'mimgui')
 local ffi = require 'ffi'
@@ -171,7 +171,7 @@ local function gameInputToUtf8(s)
 end
 local new = hasImgui and imgui.new or nil
 -- IMPORTANT: Change this address to the exact Render service where main.py is deployed.
-local BASE = 'https://samp-messenger-server-1.onrender.com'
+local BASE = 'https://samp-messenger-server-18.onrender.com'
 local DIR = getWorkingDirectory() .. '\\SAMP_Messenger\\'
 local BG_DIR = DIR .. 'backgrounds\\'
 local BIND_FILE = DIR .. 'binds.json'
@@ -286,7 +286,7 @@ end
 
 -- Silent GitHub updater (runs separately and never modifies the active in-memory Lua).
 -- Publishes a backup with .bak extension in SAMP_Messenger/backups/.
-local AUTO_UPDATE_VERSION = '1.1.6'
+local AUTO_UPDATE_VERSION = '1.1.7'
 local AUTO_UPDATE_INTERVAL_SECONDS = 1800
 local AUTO_UPDATE_HELPER = SESSION .. 'auto_updater.ps1'
 local lastAutoUpdateCheck = -999999
