@@ -794,6 +794,13 @@ def gps_update(data: GpsUpdateRequest):
                 raise HTTPException(status_code=400, detail="Missing GPS coordinates")
             entry["gps"] = {"x": data.x, "y": data.y, "z": data.z, "cuffed": data.cuffed, "last_update": now}
             result = {"ok": True, "sharing": True}
+        if cuff_just_started:
+            # Deliver the same alert through /state to every SA:MP client,
+            # including the cuffed player. No repeated alerts while cuffed.
+            cuff_text = f"{entry['nick']} в наручниках! Помогите ему!"
+            if data.share:
+                cuff_text = f"{entry['nick']} в наручниках! Помогите ему — его метка находится на карте."
+            append_message(entry["nick"], cuff_text, "cuff")
     if cuff_just_started:
         nick = entry["nick"]
         if data.share:
