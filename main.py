@@ -10,6 +10,7 @@ No additional Telegram libraries are required.
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from hashlib import sha256
+from html import escape as html_escape
 from hmac import compare_digest
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
@@ -230,12 +231,12 @@ def update_delivery(key, status: str, error: str = ""):
         tg_delivery[key] = {"status": status, "error": error[:120], "updated": monotonic()}
 
 
-def enqueue_tg(chat_id, text: str, reply_to_message_id=None, delivery_key=None):
+def enqueue_tg(chat_id, text: str, reply_to_message_id=None, delivery_key=None, parse_mode=None):
     if not BOT_TOKEN or not chat_id:
         update_delivery(delivery_key, "unavailable", "Telegram bot or group is not configured")
         return False
     try:
-        tg_outgoing.put_nowait((chat_id, text[:3900], reply_to_message_id, delivery_key))
+        tg_outgoing.put_nowait((chat_id, text[:3900], reply_to_message_id, delivery_key, parse_mode))
         return True
     except Full:
         update_delivery(delivery_key, "failed", "Telegram queue is full")
@@ -261,13 +262,15 @@ def telegram_worker():
         is_photo = bool(job and job[0] == "photo")
         if is_photo:
             _, chat_id, content, image_bytes = job
-            reply_id, delivery_key = None, None
+            reply_id, delivery_key, parse_mode = None, None, None
         else:
-            chat_id, content, reply_id, delivery_key = job
+            chat_id, content, reply_id, delivery_key, parse_mode = job
         success = False
         error = None
         try:
             payload = {"chat_id": chat_id, "text": content, "disable_web_page_preview": True}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             if isinstance(reply_id, int):
                 payload["reply_parameters"] = {"message_id": reply_id, "allow_sending_without_reply": True}
             for attempt in range(4):
@@ -707,6 +710,21 @@ def state(token: str, after: int = Query(default=0, ge=0)):
         }
 
 
+def telegram_game_text(nick: str, content: str) -> str:
+    """Only presentation for Telegram; never alters stored /g messages."""
+    nick_safe = html_escape(nick, quote=True)
+    content_safe = html_escape(content, quote=True)
+    # Already-existing cuff alert formats from other client versions.
+    cuff_alert = re.fullmatch(
+        r'[\"«»]?\s*' + re.escape(nick) +
+        r'[\"«»]?\s+(?:кафают\s+помогите\s+ему|в\s+наручниках!\s*помогите\s+ему(?:\s*[—-]\s*его\s+метка\s+находится\s+на\s+карте\.?)?)',
+        content, flags=re.IGNORECASE,
+    )
+    if cuff_alert:
+        return f"🎮 [G] <b>{nick_safe}</b> в наручниках! Помогите ему — его метка находится на карте."
+    return f"🎮 [G] <b>{nick_safe}</b>: {content_safe}"
+
+
 @app.post("/send")
 def send(data: SendRequest):
     content = data.text.strip()
@@ -724,7 +742,7 @@ def send(data: SendRequest):
             # game message. Do not requeue while another attempt is in flight.
             if receipt and receipt["status"] == "failed" and now - receipt["updated"] >= 10:
                 tg_delivery[key] = {"status": "queued", "error": "", "updated": now}
-                enqueue_tg(TG_CHAT_ID, f"🎮 [G] {entry['nick']}: {content}", delivery_key=key)
+                enqueue_tg(TG_CHAT_ID, telegram_game_text(entry["nick"], content), delivery_key=key, parse_mode="HTML")
             return {"ok": True, "id": previous_id, "duplicate": True}
         if now - entry["last_message"] < MIN_MESSAGE_INTERVAL:
             raise HTTPException(status_code=429, detail="Please wait before sending again")
@@ -740,7 +758,7 @@ def send(data: SendRequest):
                 old_receipt = tg_delivery.get(old)
                 if old_receipt and old_receipt["status"] == "delivered":
                     tg_delivery.pop(old, None)
-    enqueue_tg(TG_CHAT_ID, f"🎮 [G] {item['nick']}: {content}", delivery_key=key)
+    enqueue_tg(TG_CHAT_ID, telegram_game_text(item["nick"], content), delivery_key=key, parse_mode="HTML")
     return {"ok": True, "id": item["id"], "duplicate": False}
 
 
@@ -764,13 +782,26 @@ def gps_update(data: GpsUpdateRequest):
         now = monotonic()
         cleanup(now)
         entry = require_client(data.token, now)
+        # Cuff notification: one Telegram message per False->True transition.
+        # The client already sends the real cuff signal; GPS itself is unchanged.
+        cuff_just_started = bool(data.cuffed) and not entry.get("cuff_alert_state", False)
+        entry["cuff_alert_state"] = bool(data.cuffed)
         if not data.share:
             entry.pop("gps", None)
-            return {"ok": True, "sharing": False}
-        if data.x is None or data.y is None or data.z is None:
-            raise HTTPException(status_code=400, detail="Missing GPS coordinates")
-        entry["gps"] = {"x": data.x, "y": data.y, "z": data.z, "cuffed": data.cuffed, "last_update": now}
-        return {"ok": True, "sharing": True}
+            result = {"ok": True, "sharing": False}
+        else:
+            if data.x is None or data.y is None or data.z is None:
+                raise HTTPException(status_code=400, detail="Missing GPS coordinates")
+            entry["gps"] = {"x": data.x, "y": data.y, "z": data.z, "cuffed": data.cuffed, "last_update": now}
+            result = {"ok": True, "sharing": True}
+    if cuff_just_started:
+        nick = entry["nick"]
+        if data.share:
+            alert = f"🎮 [G] <b>{html_escape(nick, quote=True)}</b> в наручниках! Помогите ему — его метка находится на карте."
+        else:
+            alert = f"🎮 [G] <b>{html_escape(nick, quote=True)}</b> в наручниках! Помогите ему!"
+        enqueue_tg(TG_CHAT_ID, alert, parse_mode="HTML")
+    return result
 
 
 @app.get("/gps/list")
