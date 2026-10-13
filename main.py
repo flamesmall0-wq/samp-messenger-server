@@ -117,8 +117,18 @@ def register_nick(user_id, nick):
         return True
 
 
+# One shared passcode for all SA:MP accounts, configured ONLY in Render.
+# Never embed the passcode in public Lua or GitHub files.
+# Fail closed if the variable is absent or too short.
+MESSENGER_ACCESS_CODE = os.getenv("MESSENGER_ACCESS_CODE", "").strip()
+if not 8 <= len(MESSENGER_ACCESS_CODE) <= 128:
+    log.warning("MESSENGER_ACCESS_CODE not configured correctly; /join is locked")
+    MESSENGER_ACCESS_CODE = ""
+
+
 class JoinRequest(BaseModel):
     nick: str
+    access_key: str = Field(default='', max_length=128)
 
 
 class SendRequest(BaseModel):
@@ -674,7 +684,7 @@ def root():
         cleanup(monotonic())
         return {
             "status": "online", "name": "SAMP Messenger",
-            "version": "0.9-tg-reports-map", "online": len(clients),
+            "version": "0.9-tg-reports-map-shared-auth", "online": len(clients),
             "telegram_enabled": bool(BOT_TOKEN and TG_CHAT_ID),
         }
 
@@ -684,6 +694,10 @@ def join(data: JoinRequest):
     nick = data.nick.strip()
     if not NICK_RE.fullmatch(nick):
         raise HTTPException(status_code=400, detail="Nick must be 3-24 letters, digits or underscores")
+    # Same shared code works for all nicknames, with no account limit.
+    # Compare on server only; return identical error for absent/wrong code.
+    if not MESSENGER_ACCESS_CODE or not compare_digest(MESSENGER_ACCESS_CODE, data.access_key):
+        raise HTTPException(status_code=403, detail="Access denied: invalid access code. Use /gkey CODE")
     with lock:
         now = monotonic()
         cleanup(now)
@@ -1154,9 +1168,10 @@ def _fmt_report_caption(mode, start, now, rows, count_by_source):
 
 
 # ===============================================================
-# Telegram /map - user-supplied GTA San Andreas map image.
-# This feature requires Pillow and sa_map.png in the directory of main.py.
-# Existing Lua /g, GPS, Telegram reports and cuffs are unchanged.
+# Telegram /map - self-contained geographic SCHEMATIC of GTA SA.
+# No Pillow, additional files or changes to MoonLoader are needed.
+# GPS coordinates are real and use SA-MP's -3000..3000 world axes;
+# background is schematic, NOT a pixel-perfect game texture.
 
 
 def _map_nick_color(nick: str):
@@ -1313,24 +1328,8 @@ def handle_map_command(chat_id,user_id,reply_id):
             enqueue_tg(chat_id,'Не удалось поставить карту в очередь Telegram.',reply_id)
     except Exception as exc:
         log.exception('GPS map rendering failed')
-        record_report_error('gps_map', type(exc).__name__)
-        # Give an actionable diagnosis without exposing private file paths,
-        # credentials, chat IDs or other server configuration in Telegram.
-        if isinstance(exc, FileNotFoundError):
-            detail = ('Не найден файл sa_map.png. Загрузите его в корень GitHub '
-                      'рядом с main.py и дождитесь успешного Deploy на Render.')
-        elif isinstance(exc, (ImportError, ModuleNotFoundError)) or (
-            isinstance(exc, RuntimeError) and 'Pillow' in str(exc)
-        ):
-            detail = ('Не установлена библиотека Pillow. Добавьте '
-                      'Pillow>=10,<13 в requirements.txt и сделайте Redeploy.')
-        elif isinstance(exc, OSError):
-            detail = ('Не удалось открыть или обработать sa_map.png. '
-                      'Проверьте, что это настоящий PNG-файл, а не ссылка на него.')
-        else:
-            detail = ('Ошибка построения: ' + type(exc).__name__ + '. '
-                      'Откройте Render -> Logs и найдите "GPS map rendering failed".')
-        enqueue_tg(chat_id, '❌ GPS-карта: ' + detail, reply_id)
+        record_report_error('gps_map',type(exc).__name__)
+        enqueue_tg(chat_id,'Не удалось сформировать GPS-карту. Проверь логи Render.',reply_id)
 
 
 def _tg_command_allowed(chat_id, user_id):
