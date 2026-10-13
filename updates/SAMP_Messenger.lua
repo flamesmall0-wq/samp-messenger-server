@@ -1,6 +1,6 @@
 script_name('SAMP Messenger')
 script_author('Flame_Small | SAMP Messenger project')
-script_version('1.1.8')
+script_version('1.1.9')
 
 local hasImgui, imgui = pcall(require, 'mimgui')
 local ffi = require 'ffi'
@@ -286,7 +286,7 @@ end
 
 -- Silent GitHub updater (runs separately and never modifies the active in-memory Lua).
 -- Publishes a backup with .bak extension in SAMP_Messenger/backups/.
-local AUTO_UPDATE_VERSION = '1.1.8'
+local AUTO_UPDATE_VERSION = '1.1.9'
 local AUTO_UPDATE_INTERVAL_SECONDS = 1800
 local AUTO_UPDATE_HELPER = SESSION .. 'auto_updater.ps1'
 local lastAutoUpdateCheck = -999999
@@ -1024,9 +1024,23 @@ local function expandCodes(s)
     return replacements[code:lower()] or '{'..code..'}'
   end))
 end
--- Recognize only the exact automatic cuff alert format; does not trigger cuffs.
+-- Recognize the old and new exact cuff alert; never use ordinary RP chat text.
 local function isCuffHelpText(text, nick)
-  return text == ('"' .. tostring(nick or '') .. '" кафают помогите ему')
+  nick = tostring(nick or '')
+  return text == ('"' .. nick .. '" кафают помогите ему')
+      or text == (nick .. ' в наручниках! Помогите ему — его метка находится на карте.')
+end
+-- SA-MP chat supports {RRGGBB} color spans. Nick and colon are darker;
+-- [G] and message body are lighter. Telegram and cuff red are unchanged.
+local function coloredGameChat(nick, body)
+  return '{A9DBF4}[G] {6092BA}' .. tostring(nick or '?') .. ': {A9DBF4}' .. tostring(body or '')
+end
+-- Consistent display for players who have not yet upgraded their cuff alert.
+local function shownCuffAlert(text, nick)
+  if isCuffHelpText(text, nick) then
+    return tostring(nick or '') .. ' в наручниках! Помогите ему — его метка находится на карте.'
+  end
+  return text
 end
 
 local function sendMessage(txt, target)
@@ -1078,9 +1092,11 @@ local function sendMessage(txt, target)
   -- Show our own /g message in the local SA:MP chat, just like other players'.
   -- addMessage() skips the server echo for our nick, preventing duplicates.
   if show_in_game and isSampAvailable() then
-    local chatLine = isCuffHelpText(clean, shared.nick) and ('[G] ' .. clean) or ('[G] ' .. tostring(shared.nick or '?') .. ': ' .. clean)
+    local cuffNotice = isCuffHelpText(clean, shared.nick)
+    local chatLine = cuffNotice and ('[G] ' .. shownCuffAlert(clean, shared.nick))
+      or coloredGameChat(shared.nick, clean)
     local converted, cp1251 = pcall(function() return u8:decode(chatLine) end)
-    sampAddChatMessage(converted and cp1251 or chatLine, isCuffHelpText(clean, shared.nick) and 0xFF3535 or 0x69B8DB)
+    sampAddChatMessage(converted and cp1251 or chatLine, cuffNotice and 0xFF3535 or 0xA9DBF4)
   end
   showToast('Отправляется в Telegram: ' .. clean)
   return true
@@ -1102,8 +1118,9 @@ local function addMessage(entry)
     local prefix = (isTelegram and '[TG] ' or '[G] ') .. nickname .. ': '
     -- Telegram messages are violet; the standard /g chat stays light blue.
     local cuffNotice = not isTelegram and isCuffHelpText(message, nickname)
-    local display = cuffNotice and ('[G] ' .. message) or (prefix .. message)
-    sampAddChatMessage(safeChatText(display), cuffNotice and 0xFF3535 or (isTelegram and 0xD5A0FF or 0x69B8DB))
+    local display = cuffNotice and ('[G] ' .. shownCuffAlert(message, nickname))
+      or (isTelegram and (prefix .. message) or coloredGameChat(nickname, message))
+    sampAddChatMessage(safeChatText(display), cuffNotice and 0xFF3535 or (isTelegram and 0xD5A0FF or 0xA9DBF4))
   end
 end
 
@@ -1365,7 +1382,7 @@ local function cuffHelpTick()
   -- Silence errors when offline: no unwanted queue or repeated chat warnings.
   if not (bridgeReady and shared.connected and shared.nick~='') then return end
   cuffAlert.next_try_ms=now+5000
-  local message='"'..shared.nick..'" кафают помогите ему'
+  local message=shared.nick..' в наручниках! Помогите ему — его метка находится на карте.'
   if sendMessage(message,1) then cuffAlert.sent=true end
 end
 
@@ -1814,7 +1831,7 @@ function main()
     local ok, utftext = pcall(gameInputToUtf8, txt)
     sendMessage(expandCodes(ok and utftext or txt), 1)
   end)
-  sampAddChatMessage(safeChatText('[SAMP Messenger] 1.1.8 (Помощь /gpshelp, /messhelp; код /gkey)'),0x66CCFF)
+  sampAddChatMessage(safeChatText('[SAMP Messenger] 1.1.9 (Помощь /gpshelp, /messhelp; код /gkey)'),0x66CCFF)
   checkAutoUpdate()
   local ok,id = sampGetPlayerIdByCharHandle(PLAYER_PED)
   if ok then
