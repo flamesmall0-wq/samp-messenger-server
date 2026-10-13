@@ -27,6 +27,7 @@ import zlib
 import math
 from contextlib import contextmanager
 from io import BytesIO
+from html import escape as html_escape
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -240,17 +241,32 @@ def update_delivery(key, status: str, error: str = ""):
         tg_delivery[key] = {"status": status, "error": error[:120], "updated": monotonic()}
 
 
-def enqueue_tg(chat_id, text: str, reply_to_message_id=None, delivery_key=None):
+def enqueue_tg(chat_id, text: str, reply_to_message_id=None, delivery_key=None, parse_mode=None):
     if not BOT_TOKEN or not chat_id:
         update_delivery(delivery_key, "unavailable", "Telegram bot or group is not configured")
         return False
     try:
-        tg_outgoing.put_nowait((chat_id, text[:3900], reply_to_message_id, delivery_key))
+        job = (chat_id, text[:3900], reply_to_message_id, delivery_key)
+        # Preserve all existing 4-field queue jobs; only game relay uses HTML.
+        if parse_mode:
+            job += (parse_mode,)
+        tg_outgoing.put_nowait(job)
         return True
     except Full:
         update_delivery(delivery_key, "failed", "Telegram queue is full")
         log.warning("Telegram outgoing queue full")
         return False
+
+
+def format_game_telegram_message(nick: str, content: str):
+    """Telegram HTML with bold sender; no sender prefix for cuff-help alerts.
+
+    Match the client's exact automatic alert text rather than removing sender
+    names from other messages. HTML-escape user content before enabling HTML.
+    """
+    if content == f'"{nick}" кафают помогите ему':
+        return f"🎮 [G] {html_escape(content)}"
+    return f'🎮 [G] <b>{html_escape(nick)}</b>: "{html_escape(content)}"'
 
 
 def _telegram_error_name(exc):
@@ -273,11 +289,17 @@ def telegram_worker():
             _, chat_id, content, image_bytes = job
             reply_id, delivery_key = None, None
         else:
-            chat_id, content, reply_id, delivery_key = job
+            if len(job) == 5:
+                chat_id, content, reply_id, delivery_key, parse_mode = job
+            else:
+                chat_id, content, reply_id, delivery_key = job
+                parse_mode = None
         success = False
         error = None
         try:
             payload = {"chat_id": chat_id, "text": content, "disable_web_page_preview": True}
+            if not is_photo and parse_mode:
+                payload["parse_mode"] = parse_mode
             if isinstance(reply_id, int):
                 payload["reply_parameters"] = {"message_id": reply_id, "allow_sending_without_reply": True}
             for attempt in range(4):
@@ -738,7 +760,7 @@ def send(data: SendRequest):
             # game message. Do not requeue while another attempt is in flight.
             if receipt and receipt["status"] == "failed" and now - receipt["updated"] >= 10:
                 tg_delivery[key] = {"status": "queued", "error": "", "updated": now}
-                enqueue_tg(TG_CHAT_ID, f"🎮 [G] {entry['nick']}: {content}", delivery_key=key)
+                enqueue_tg(TG_CHAT_ID, format_game_telegram_message(entry['nick'], content), delivery_key=key, parse_mode="HTML")
             return {"ok": True, "id": previous_id, "duplicate": True}
         if now - entry["last_message"] < MIN_MESSAGE_INTERVAL:
             raise HTTPException(status_code=429, detail="Please wait before sending again")
@@ -754,7 +776,7 @@ def send(data: SendRequest):
                 old_receipt = tg_delivery.get(old)
                 if old_receipt and old_receipt["status"] == "delivered":
                     tg_delivery.pop(old, None)
-    enqueue_tg(TG_CHAT_ID, f"🎮 [G] {item['nick']}: {content}", delivery_key=key)
+    enqueue_tg(TG_CHAT_ID, format_game_telegram_message(item['nick'], content), delivery_key=key, parse_mode="HTML")
     return {"ok": True, "id": item["id"], "duplicate": False}
 
 
